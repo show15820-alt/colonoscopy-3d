@@ -1,0 +1,1434 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>大腸鏡檢查流程 3D 動畫</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #0b1016; }
+  canvas { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<script type="module">
+// ---- load three.js + official addons (import map first, CDN ESM bundles as fallback) ----
+const ADDONS = [
+  'geometries/RoundedBoxGeometry.js', 'utils/BufferGeometryUtils.js', 'environments/RoomEnvironment.js',
+  'postprocessing/EffectComposer.js', 'postprocessing/RenderPass.js', 'postprocessing/UnrealBloomPass.js', 'postprocessing/OutputPass.js',
+  'controls/OrbitControls.js',
+];
+async function loadThree() {
+  const tries = [
+    () => ['three', (p) => 'three/addons/' + p],
+    () => ['https://cdn.jsdelivr.net/npm/three@0.170.0/+esm', (p) => 'https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/' + p + '/+esm'],
+    () => ['https://unpkg.com/three@0.170.0/build/three.module.js?module', (p) => 'https://unpkg.com/three@0.170.0/examples/jsm/' + p + '?module'],
+  ];
+  let err;
+  for (const t of tries) {
+    try {
+      const [core, addon] = t();
+      const THREE = await import(core);
+      const mods = await Promise.all(ADDONS.map((p) => import(addon(p))));
+      return [THREE, ...mods];
+    } catch (e) { err = e; console.warn('three.js load attempt failed', e); }
+  }
+  throw err;
+}
+const [THREE, mRB, mBGU, mRE, mEC, mRP, mUB, mOP, mOC] = await loadThree();
+const { RoundedBoxGeometry } = mRB, { mergeGeometries } = mBGU, { RoomEnvironment } = mRE;
+const { EffectComposer } = mEC, { RenderPass } = mRP, { UnrealBloomPass } = mUB, { OutputPass } = mOP, { OrbitControls } = mOC;
+const V3 = THREE.Vector3;
+const FONT = 'system-ui,"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif';
+
+// ================= textures =================
+const TX = (() => {
+
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function tex(w, h, draw, opts = {}) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  draw(g, w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = opts.data ? THREE.NoColorSpace : THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = opts.clamp ? THREE.ClampToEdgeWrapping : THREE.RepeatWrapping;
+  t.anisotropy = 8;
+  return t;
+}
+function speckle(g, w, h, n, r, colors, amax, size = 2) {
+  for (let i = 0; i < n; i++) {
+    g.fillStyle = colors[(r() * colors.length) | 0];
+    g.globalAlpha = r() * amax;
+    const s = 1 + r() * size;
+    g.fillRect(r() * w, r() * h, s, s);
+  }
+  g.globalAlpha = 1;
+}
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath(); g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+// soft blotch drawn with wrap-around so the texture tiles
+function blotch(g, w, h, x, y, rad, col) {
+  for (const ox of [-w, 0, w]) for (const oy of [-h, 0, h]) {
+    const cx = x + ox, cy = y + oy;
+    if (cx + rad < 0 || cx - rad > w || cy + rad < 0 || cy - rad > h) continue;
+    const gr = g.createRadialGradient(cx, cy, 0, cx, cy, rad);
+    gr.addColorStop(0, col); gr.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = gr; g.fillRect(cx - rad, cy - rad, rad * 2, rad * 2);
+  }
+}
+
+function floorTexture() {
+  return tex(512, 512, (g, w, h) => {
+    const r = rng(11);
+    g.fillStyle = '#b7c3c6'; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 90; i++) blotch(g, w, h, r() * w, r() * h, 30 + r() * 90, r() < 0.5 ? 'rgba(110,125,130,0.10)' : 'rgba(235,242,244,0.12)');
+    speckle(g, w, h, 9000, r, ['#8d989c', '#eef3f4', '#6f7a7f', '#d0d8db'], 0.45, 2);
+    g.fillStyle = 'rgba(70,85,90,0.35)'; g.fillRect(0, 0, w, 2); g.fillRect(0, 0, 2, h);
+  });
+}
+function wallTexture() {
+  return tex(512, 1024, (g, w, h) => {
+    const r = rng(21);
+    const gr = g.createLinearGradient(0, 0, 0, h);
+    gr.addColorStop(0, '#c6d6d8'); gr.addColorStop(0.7, '#dfe9ea'); gr.addColorStop(1, '#d4e0e1');
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    speckle(g, w, h, 4000, r, ['#aebec2', '#f4f8f9'], 0.2, 2);
+    g.fillStyle = '#4a9a93'; g.fillRect(0, h * 0.70, w, h * 0.018);
+    g.fillStyle = '#2f6f6b'; g.fillRect(0, h * 0.965, w, h * 0.035);
+    g.fillStyle = 'rgba(80,100,105,0.22)'; g.fillRect(0, 0, 3, h);
+  });
+}
+// colon mucosa: salmon-pink base, soft mottling and a branching vascular network (tiles in both directions)
+function mucosaTexture() {
+  return tex(1024, 512, (g, w, h) => {
+    const r = rng(91);
+    g.fillStyle = '#e8907c'; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 380; i++) blotch(g, w, h, r() * w, r() * h, 18 + r() * 70, r() < 0.5 ? 'rgba(196,84,72,0.13)' : 'rgba(255,196,176,0.14)');
+    g.lineCap = 'round'; g.lineJoin = 'round';
+    const seg = (x0, y0, x1, y1) => {
+      const xs = [0], ys = [0];
+      if (Math.min(x0, x1) < 12) xs.push(w); if (Math.max(x0, x1) > w - 12) xs.push(-w);
+      if (Math.min(y0, y1) < 12) ys.push(h); if (Math.max(y0, y1) > h - 12) ys.push(-h);
+      for (const ox of xs) for (const oy of ys) { g.beginPath(); g.moveTo(x0 + ox, y0 + oy); g.lineTo(x1 + ox, y1 + oy); g.stroke(); }
+    };
+    const walk = (x, y, a, width, n, depth) => {
+      for (let k = 0; k < n; k++) {
+        const nx = x + Math.cos(a) * 5, ny = y + Math.sin(a) * 5;
+        g.lineWidth = width; seg(x, y, nx, ny);
+        x = ((nx % w) + w) % w; y = ((ny % h) + h) % h;
+        a += (r() - 0.5) * 0.65; width = Math.max(0.6, width * 0.988);
+        if (depth < 3 && r() < 0.06) walk(x, y, a + (r() < 0.5 ? 1 : -1) * (0.6 + r() * 0.6), width * 0.7, ((n - k) * 0.6) | 0, depth + 1);
+      }
+    };
+    for (let i = 0; i < 30; i++) {
+      g.strokeStyle = `rgba(${(140 + r() * 40) | 0},${(28 + r() * 26) | 0},${(38 + r() * 26) | 0},${0.32 + r() * 0.3})`;
+      walk(r() * w, r() * h, r() * 6.28, 1.5 + r() * 2.2, (40 + r() * 70) | 0, 0);
+    }
+    g.strokeStyle = 'rgba(170,60,60,0.16)';
+    for (let i = 0; i < 160; i++) walk(r() * w, r() * h, r() * 6.28, 0.7, (6 + r() * 12) | 0, 3);
+    speckle(g, w, h, 5000, r, ['#ffd0c0', '#c8665a'], 0.18, 1.5);
+  });
+}
+function glowTexture() {
+  return tex(128, 128, (g) => {
+    const gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+    gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.15, 'rgba(255,255,255,0.75)');
+    gr.addColorStop(0.45, 'rgba(255,255,255,0.18)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, 128, 128);
+  }, { clamp: true });
+}
+function smokeTexture() {
+  return tex(128, 128, (g) => {
+    const r = rng(51);
+    for (let i = 0; i < 26; i++) {
+      const x = 64 + (r() - 0.5) * 56, y = 64 + (r() - 0.5) * 56, rad = 14 + r() * 22;
+      const gr = g.createRadialGradient(x, y, 0, x, y, rad);
+      gr.addColorStop(0, 'rgba(255,255,255,0.2)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+      g.fillStyle = gr; g.fillRect(0, 0, 128, 128);
+    }
+  }, { clamp: true });
+}
+function labelTexture(text, accent = '#7fd3ff') {
+  let frac = 1;
+  const t = tex(512, 128, (g) => {
+    g.font = `700 54px ${FONT}`;
+    const tw = Math.min(500, g.measureText(text).width + 60), x0 = (512 - tw) / 2;
+    frac = tw / 512;
+    g.fillStyle = 'rgba(8,14,22,0.8)'; roundRect(g, x0, 16, tw, 96, 30); g.fill();
+    g.strokeStyle = accent; g.lineWidth = 5; roundRect(g, x0 + 2.5, 18.5, tw - 5, 91, 28); g.stroke();
+    g.fillStyle = '#ffffff'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 256, 66);
+  }, { clamp: true });
+  t.userData.frac = frac;     // visible width of the pill as a fraction of the sprite
+  return t;
+}
+// AI detection box (corner brackets), tinted green by the sprite colour
+function cadeTexture() {
+  return tex(256, 256, (g) => {
+    g.strokeStyle = '#ffffff'; g.lineWidth = 10; g.lineCap = 'square';
+    const a = 20, b = 236, k = 54;
+    for (const [x, y, dx, dy] of [[a, a, 1, 1], [b, a, -1, 1], [a, b, 1, -1], [b, b, -1, -1]]) {
+      g.beginPath(); g.moveTo(x + dx * k, y); g.lineTo(x, y); g.lineTo(x, y + dy * k); g.stroke();
+    }
+  }, { clamp: true });
+}
+// octagonal endoscope image mask (white = visible)
+function maskTexture() {
+  return tex(256, 256, (g, w, h) => {
+    g.fillStyle = '#000'; g.fillRect(0, 0, w, h);
+    const c = 0.2 * w;
+    g.fillStyle = '#fff'; g.beginPath();
+    g.moveTo(c, 4); g.lineTo(w - c, 4); g.lineTo(w - 4, c); g.lineTo(w - 4, h - c); g.lineTo(w - c, h - 4); g.lineTo(c, h - 4); g.lineTo(4, h - c); g.lineTo(4, c); g.closePath(); g.fill();
+  }, { clamp: true, data: true });
+}
+function monitorSideTexture() {
+  return tex(256, 512, (g, w, h) => {
+    g.fillStyle = '#000'; g.fillRect(0, 0, w, h);
+    g.fillStyle = '#d8e2ea'; g.font = `600 26px ${FONT}`;
+    ['大腸鏡檢查', '示範病例 A', '55 歲', '', 'CO₂ 送氣', '影像強化 1', '放大 ×1.0'].forEach((s, i) => g.fillText(s, 18, 48 + i * 42));
+    g.fillStyle = '#4fd1ff'; g.fillRect(18, h - 70, 120, 6);
+  }, { clamp: true });
+}
+return { rng, tex, speckle, roundRect, floorTexture, wallTexture, mucosaTexture, glowTexture, smokeTexture, labelTexture, cadeTexture, maskTexture, monitorSideTexture };
+})();
+
+// ================= util =================
+const U = (() => {
+const std = (color, rough = 0.6, metal = 0, extra = {}) =>
+  new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal, ...extra });
+function add(geo, mat, parent, x = 0, y = 0, z = 0, shadow = true) {
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(x, y, z);
+  m.castShadow = shadow; m.receiveShadow = shadow;
+  if (parent) parent.add(m);
+  return m;
+}
+const boxCache = new Map();
+function box(w, h, d, mat, parent, x = 0, y = 0, z = 0, shadow = true) {
+  const k = `${w},${h},${d}`;
+  let g = boxCache.get(k);
+  if (!g) { g = new THREE.BoxGeometry(w, h, d); boxCache.set(k, g); }
+  return add(g, mat, parent, x, y, z, shadow);
+}
+function rbox(w, h, d, rad, mat, parent, x = 0, y = 0, z = 0) {
+  return add(new RoundedBoxGeometry(w, h, d, 3, rad), mat, parent, x, y, z);
+}
+function cyl(r, len, mat, parent, x = 0, y = 0, z = 0, axis = 'y', seg = 20, r2 = r, open = false) {
+  const g = new THREE.CylinderGeometry(r2, r, len, seg, 1, open);
+  if (axis === 'x') g.rotateZ(-Math.PI / 2);
+  if (axis === 'z') g.rotateX(Math.PI / 2);
+  return add(g, mat, parent, x, y, z);
+}
+function sph(r, mat, parent, x = 0, y = 0, z = 0, seg = 18) {
+  return add(new THREE.SphereGeometry(r, seg, Math.max(8, seg * 0.6 | 0)), mat, parent, x, y, z);
+}
+const _Y = new V3(0, 1, 0);
+// capsule from point a to point b
+function limb(a, b, r, mat, parent) {
+  const d = new V3().subVectors(b, a), len = d.length();
+  const m = add(new THREE.CapsuleGeometry(r, Math.max(0.01, len), 4, 12), mat, parent);
+  m.position.copy(a).addScaledVector(d, 0.5);
+  m.quaternion.setFromUnitVectors(_Y, d.normalize());
+  return m;
+}
+// rim-lit "x-ray" material for the patient's body and organs
+function fresnelMat(color, pow = 2.2, base = 0.04, str = 1.0) {
+  return new THREE.ShaderMaterial({
+    uniforms: { uColor: { value: new THREE.Color(color) }, uPow: { value: pow }, uBase: { value: base }, uStr: { value: str }, uOpacity: { value: 1 } },
+    vertexShader: 'varying vec3 vN; varying vec3 vV; void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); vN = normalize(normalMatrix * normal); vV = normalize(-mv.xyz); gl_Position = projectionMatrix * mv; }',
+    fragmentShader: 'uniform vec3 uColor; uniform float uPow, uBase, uStr, uOpacity; varying vec3 vN; varying vec3 vV; void main(){ float f = pow(1.0 - abs(dot(normalize(vN), normalize(vV))), uPow); float a = clamp((uBase + f * uStr) * uOpacity, 0.0, 1.0); gl_FragColor = vec4(uColor, a); }',
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+  });
+}
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+const smooth = (v) => { v = clamp01(v); return v * v * (3 - 2 * v); };
+const ease = (v) => { v = clamp01(v); return v * v * v * (v * (v * 6 - 15) + 10); };
+// Merge static meshes under `group` by material to cut draw calls. Anything flagged userData.dyn is left alone.
+function mergeStatic(group, recursive = true) {
+  group.updateMatrixWorld(true);
+  const inv = new THREE.Matrix4().copy(group.matrixWorld).invert();
+  const buckets = new Map();
+  const rel = new THREE.Matrix4();
+  const walk = (o) => {
+    for (const c of [...o.children]) {
+      if (c.userData.dyn) continue;
+      if (c.isMesh && !c.isInstancedMesh) {
+        if (!c.visible || c.children.length) continue;
+        const key = c.material.uuid + (c.castShadow ? 'c' : '') + (c.receiveShadow ? 'r' : '') + c.renderOrder;
+        let b = buckets.get(key);
+        if (!b) { b = { mat: c.material, cast: c.castShadow, recv: c.receiveShadow, ro: c.renderOrder, geos: [] }; buckets.set(key, b); }
+        rel.multiplyMatrices(inv, c.matrixWorld);
+        b.geos.push(c.geometry.clone().applyMatrix4(rel));
+        o.remove(c);
+      } else if (recursive && c.isGroup) walk(c);
+    }
+  };
+  walk(group);
+  for (const b of buckets.values()) {
+    if (b.geos.some((x) => !x.index)) b.geos = b.geos.map((x) => (x.index ? x.toNonIndexed() : x));
+    const keep = ['position', 'normal', 'uv'];
+    for (const x of b.geos) for (const n of Object.keys(x.attributes)) if (!keep.includes(n)) x.deleteAttribute(n);
+    const g = b.geos.length > 1 ? mergeGeometries(b.geos, false) : b.geos[0];
+    if (!g) continue;
+    const m = new THREE.Mesh(g, b.mat);
+    m.castShadow = b.cast; m.receiveShadow = b.recv; m.renderOrder = b.ro;
+    group.add(m);
+  }
+}
+return { std, add, box, rbox, cyl, sph, limb, fresnelMat, clamp01, smooth, ease, mergeStatic };
+})();
+const { std, add, box, rbox, cyl, sph, limb, fresnelMat, clamp01, smooth, ease, mergeStatic } = U;
+
+// ================= anatomy: colon centreline (patient frame: x = patient's left, y = head, z = front; 1 unit = 10 cm) =================
+const A = (() => {
+const PTS = [
+  [0.00, -2.10, -0.30], [0.00, -1.85, -0.52], [0.02, -1.45, -0.74], [0.06, -1.05, -0.72], [0.15, -0.80, -0.48],          // 0-4 anus, rectum
+  [-0.15, -0.70, -0.10], [-0.45, -0.52, 0.22], [-0.32, -0.22, 0.42], [0.15, -0.18, 0.40], [0.55, -0.42, 0.24], [0.92, -0.70, 0.02], // 5-10 sigmoid loop
+  [1.15, -0.45, -0.24], [1.20, 0.10, -0.34], [1.18, 0.70, -0.38],                                                         // 11-13 descending
+  [1.10, 1.22, -0.32], [0.88, 1.44, -0.08],                                                                               // 14-15 splenic flexure
+  [0.62, 1.20, 0.20], [0.20, 0.86, 0.40], [-0.30, 0.78, 0.42], [-0.75, 0.95, 0.30],                                      // 16-19 transverse
+  [-1.02, 1.20, 0.05], [-1.15, 1.04, -0.22],                                                                              // 20-21 hepatic flexure
+  [-1.20, 0.55, -0.25], [-1.20, 0.00, -0.18],                                                                             // 22-23 ascending
+  [-1.12, -0.48, -0.08], [-1.02, -0.74, -0.02],                                                                           // 24-25 caecum
+].map((p) => new V3(...p));
+const curve = new THREE.CatmullRomCurve3(PTS, false, 'centripetal');
+const L = curve.getLength();
+const NF = 1400;
+const fr = curve.computeFrenetFrames(NF, false);
+const C = curve.getSpacedPoints(NF);
+const ctrlS = PTS.map((p) => { let bi = 0, bd = 1e9; for (let i = 0; i <= NF; i++) { const d = C[i].distanceToSquared(p); if (d < bd) { bd = d; bi = i; } } return bi / NF; });
+const SEG = [
+  { name: '直腸', a: 0, b: 4, R: 0.32 },
+  { name: '乙狀結腸', a: 4, b: 11, R: 0.24 },
+  { name: '降結腸', a: 11, b: 14, R: 0.25 },
+  { name: '脾彎曲', a: 14, b: 16, R: 0.27 },
+  { name: '橫結腸', a: 16, b: 20, R: 0.28 },
+  { name: '肝彎曲', a: 20, b: 22, R: 0.29 },
+  { name: '升結腸', a: 22, b: 24, R: 0.31 },
+  { name: '盲腸', a: 24, b: 25, R: 0.37 },
+];
+for (const g of SEG) { g.s0 = ctrlS[g.a]; g.s1 = ctrlS[g.b]; }
+SEG[0].s0 = 0; SEG[SEG.length - 1].s1 = 1;
+for (const g of SEG) g.sm = (g.s0 + g.s1) / 2;
+const segAt = (s) => { for (let i = 0; i < SEG.length; i++) if (s <= SEG[i].s1) return i; return SEG.length - 1; };
+const lenAt = (i) => ctrlS[i] * L;
+
+function frameAt(s, P, Tg, N, B) {
+  const ss = Math.min(1, Math.max(0, s)), f = ss * NF, i = Math.min(NF - 1, Math.floor(f)), u = f - i;
+  P.lerpVectors(C[i], C[i + 1], u);
+  if (s > 1) P.addScaledVector(fr.tangents[NF], (s - 1) * L);
+  if (Tg) Tg.lerpVectors(fr.tangents[i], fr.tangents[i + 1], u).normalize();
+  if (N) N.lerpVectors(fr.normals[i], fr.normals[i + 1], u).normalize();
+  if (B) B.lerpVectors(fr.binormals[i], fr.binormals[i + 1], u).normalize();
+  return P;
+}
+function radiusAt(s) {
+  let r = SEG[0].R;
+  if (s >= SEG[SEG.length - 1].sm) r = SEG[SEG.length - 1].R;
+  else if (s > SEG[0].sm) {
+    for (let i = 0; i < SEG.length - 1; i++) if (s <= SEG[i + 1].sm) { const u = smooth((s - SEG[i].sm) / (SEG[i + 1].sm - SEG[i].sm)); r = SEG[i].R + (SEG[i + 1].R - SEG[i].R) * u; break; }
+  }
+  return r * (0.35 + 0.65 * smooth(s * L / 0.35));   // anal canal is narrow
+}
+// folds: three rectal (Houston) valves + haustral folds from the sigmoid to the caecum
+const TAE = 0.45;                 // angular position of the three taeniae bands (+ k * 120 deg)
+const folds = [];
+for (const [l, ang] of [[0.62, 0.0], [0.98, Math.PI], [1.34, 0.4]]) folds.push({ l, amp: 0.36, w: 0.055, ang, valve: true });
+const lColon = SEG[1].s0 * L;
+{
+  const r = TX.rng(404);
+  const tS = SEG[4].s0 * L, tE = SEG[4].s1 * L;
+  for (let l = lColon + 0.25; l < L - 0.4; l += 0.34 + r() * 0.12) {
+    const tri = l > tS && l < tE ? 1.25 : 1;    // transverse folds are taller (triangular lumen)
+    folds.push({ l, amp: (0.19 + r() * 0.08) * tri, w: 0.045, ang: TAE, valve: false });
+  }
+}
+const colonMask = (l) => smooth((l - lColon + 0.1) / 0.4);
+function rIn(s, th) {
+  const l = s * L, R = radiusAt(s);
+  let f = 0;
+  for (const k of folds) {
+    const d = (l - k.l) / k.w; if (d > 3 || d < -3) continue;
+    const ang = k.valve ? Math.pow(Math.max(0, Math.cos(th - k.ang)), 1.5) : 0.5 + 0.5 * Math.cos(3 * (th - k.ang));
+    f += k.amp * Math.exp(-d * d) * ang;
+  }
+  const tae = colonMask(l) * 0.05 * Math.pow(Math.max(0, Math.cos(3 * (th - TAE) + Math.PI)), 10);
+  return R * (1 - Math.min(0.6, f) - tae);
+}
+function rOut(s, th) {
+  const l = s * L, R = radiusAt(s), cm = colonMask(l);
+  let f = 0;
+  for (const k of folds) { if (k.valve) continue; const d = (l - k.l) / (k.w * 1.7); if (d > 3 || d < -3) continue; f += Math.exp(-d * d); }
+  const bulge = 1 - Math.min(1, f);
+  const groove = Math.pow(Math.max(0, Math.cos(3 * (th - TAE) + Math.PI)), 6);
+  return R * (0.97 + cm * (0.15 * bulge * (1 - groove) - 0.06 * groove));
+}
+function tube(N, M, rf, inward, uLen) {
+  const pos = new Float32Array((N + 1) * (M + 1) * 3), uv = new Float32Array((N + 1) * (M + 1) * 2), idx = [];
+  const P = new V3(), Tg = new V3(), Nn = new V3(), B = new V3();
+  for (let i = 0; i <= N; i++) {
+    const s = i / N; frameAt(s, P, Tg, Nn, B);
+    for (let j = 0; j <= M; j++) {
+      const th = (j / M) * Math.PI * 2, c = Math.cos(th), sn = Math.sin(th), r = rf(s, th % (Math.PI * 2));
+      const k = i * (M + 1) + j;
+      pos[k * 3] = P.x + (Nn.x * c + B.x * sn) * r; pos[k * 3 + 1] = P.y + (Nn.y * c + B.y * sn) * r; pos[k * 3 + 2] = P.z + (Nn.z * c + B.z * sn) * r;
+      uv[k * 2] = (s * L) / uLen; uv[k * 2 + 1] = j / M;
+    }
+  }
+  for (let i = 0; i < N; i++) for (let j = 0; j < M; j++) {
+    const a = i * (M + 1) + j, b = a + M + 1;
+    if (inward) idx.push(a, b, a + 1, b, b + 1, a + 1); else idx.push(a, a + 1, b, b, a + 1, b + 1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  g.setIndex(idx); g.computeVertexNormals();
+  const n = g.attributes.normal;               // weld the seam normals
+  for (let i = 0; i <= N; i++) {
+    const a = i * (M + 1), b = a + M;
+    const x = n.getX(a) + n.getX(b), y = n.getY(a) + n.getY(b), z = n.getZ(a) + n.getZ(b), l = Math.hypot(x, y, z) || 1;
+    n.setXYZ(a, x / l, y / l, z / l); n.setXYZ(b, x / l, y / l, z / l);
+  }
+  return g;
+}
+// polyp: a pedunculated polyp in the middle of the transverse colon, between two folds
+const hf = folds.filter((k) => !k.valve);
+const lMid = (SEG[4].s0 + SEG[4].s1) / 2 * L;
+let lp = lMid;
+for (let i = 0; i < hf.length - 1; i++) if (hf[i].l <= lMid && hf[i + 1].l > lMid) { lp = (hf[i].l + hf[i + 1].l) / 2; break; }
+const polyp = { l: lp, s: lp / L, th: TAE + (2 * Math.PI) / 3 };
+return { PTS, curve, L, NF, C, fr, ctrlS, SEG, segAt, lenAt, frameAt, radiusAt, rIn, rOut, tube, folds, polyp, TAE };
+})();
+
+// ================= procedure timeline =================
+const TL = (() => {
+const T = 96;
+const STEPS = [
+  { t0: 0, t1: 9, title: '腸道準備', short: '低渣飲食、喝清腸劑', lines: [
+    [0, '檢查前 2–3 天改吃低渣飲食，避開蔬果皮、種子和高纖食物。'],
+    [3, '前一晚和檢查當天早上分次喝清腸劑，把腸道裡的內容物排乾淨。'],
+    [6, '排出的液體變成清澈的淡黃色就代表準備好了；腸道越乾淨，越不容易漏看小息肉。'] ] },
+  { t0: 9, t1: 16, title: '鎮靜與擺位', short: '監測生命徵象、左側躺', lines: [
+    [9, '護理師接上點滴和生理監視器，全程監測心跳、血氧和血壓。'],
+    [11.5, '選擇無痛（鎮靜）大腸鏡的話，會從點滴給藥，病人幾分鐘內就進入淺睡。'],
+    [13.5, '病人轉成左側躺、雙膝彎向胸前，這是放入內視鏡最順手的姿勢。'] ] },
+  { t0: 16, t1: 23, title: '進入直腸', short: '潤滑後經肛門插入', lines: [
+    [16, '醫師先做肛門指診、塗上潤滑劑，再把內視鏡輕輕送進肛門。'],
+    [18.5, '鏡頭前端有光源和攝影機，腸道畫面即時顯示在螢幕上（右上角小畫面）。'],
+    [20.5, '同時打入二氧化碳把腸道撐開；二氧化碳吸收得比空氣快，檢查後比較不脹。'] ] },
+  { t0: 23, t1: 33, title: '通過乙狀結腸', short: '最彎曲、最容易打圈', lines: [
+    [23, '乙狀結腸彎曲又容易移動，是整個插入過程中最考驗技術的一段。'],
+    [26, '醫師用「旋轉、回抽、把鏡身拉直」的技巧前進，必要時請助手按壓腹部。'],
+    [30, '這時有些人會覺得短暫脹痛或想排氣，是正常反應。'] ] },
+  { t0: 33, t1: 39, title: '降結腸與脾彎曲', short: '左側直線段、轉大彎', lines: [
+    [33, '降結腸在身體左側，路徑比較直，鏡子可以前進得比較快。'],
+    [36, '到了左上腹的脾彎曲，要轉一個將近 180 度的大彎，才能進入橫結腸。'] ] },
+  { t0: 39, t1: 46, title: '橫結腸與肝彎曲', short: '三角形皺褶', lines: [
+    [39, '橫結腸橫跨上腹部，腸壁皺褶呈三角形，是醫師判斷位置的線索。'],
+    [42.5, '到了右上腹的肝彎曲，常能隔著腸壁看到肝臟透出的藍灰色影子。'] ] },
+  { t0: 46, t1: 54, title: '抵達盲腸', short: '確認闌尾開口、迴盲瓣', lines: [
+    [46, '通過升結腸後，鏡子抵達大腸最深處的盲腸。'],
+    [49.5, '看到闌尾開口和迴盲瓣，才算真正把整段大腸「走完」。'],
+    [52, '「盲腸到達率」是檢查品質的重要指標，一般要求至少 90%。'] ] },
+  { t0: 54, t1: 68, title: '退鏡仔細觀察', short: '退鏡時間至少 6 分鐘', lines: [
+    [54, '真正的「檢查」是在退鏡時進行：醫師一邊慢慢抽回，一邊環繞觀察整圈腸壁。'],
+    [58.5, '醫師會沖水清洗殘渣、翻看皺褶後方，避免躲在死角的病灶被漏掉。'],
+    [63, '研究顯示，退鏡觀察時間至少 6 分鐘，息肉的發現率會明顯提高。'] ] },
+  { t0: 68, t1: 84, title: '發現息肉並切除', short: 'AI 輔助偵測、圈套切除', lines: [
+    [68, '在橫結腸發現一顆約 1.2 公分的有蒂息肉，AI 輔助偵測系統即時框出提醒。'],
+    [70, '醫師轉動鏡身，把息肉調整到畫面下方、靠近工作管道出口的位置。'],
+    [72.5, '從工作管道伸出圈套器，張開金屬線圈，往下套住息肉的根部（蒂）。'],
+    [75, '慢慢收緊線圈，確認只套住息肉、沒有夾到旁邊正常的腸壁。'],
+    [77, '通上高頻電流切下息肉，電流同時燒灼、封住小血管，減少出血。'],
+    [79, '把切下的息肉吸回鏡子裡取出，稍後送去做病理化驗。'],
+    [81, '必要時在傷口夾上止血夾，降低延遲出血的機會；夾子之後會自然脫落排出。'] ] },
+  { t0: 84, t1: 96, title: '退出與恢復', short: '退鏡到肛門、恢復室休息', lines: [
+    [84, '繼續退鏡，把剩下的橫結腸、降結腸、乙狀結腸和直腸再仔細看一遍。'],
+    [89, '抽掉腸內的氣體後退出內視鏡，整個檢查大約 15–30 分鐘。'],
+    [92.5, '在恢復室休息到清醒，當天不要開車；病理報告約一週後回診說明。'] ] },
+];
+const lR = A.lenAt(4), lS = A.lenAt(11), lSp = A.lenAt(16), lH = A.lenAt(22), lE = A.L - 0.3;
+const lCam = A.polyp.l - 0.62, lNear = A.polyp.l - 0.4;
+const KEYS = [[0, -1.2], [15.5, -1.2], [17.6, -0.05], [18.2, 0.03], [23, lR], [33, lS], [39, lSp], [46, lH], [52, lE], [54, lE],
+  [68, lCam], [70, lCam], [72.4, lNear], [81, lNear], [84, lCam], [93, 0], [94.2, -1.2], [96, -1.2]];
+function sigma(tc) {
+  for (let i = 0; i < KEYS.length - 1; i++) {
+    const [ta, a] = KEYS[i], [tb, b] = KEYS[i + 1];
+    if (tc <= tb) {
+      const u = clamp01((tc - ta) / (tb - ta));
+      let w = smooth(u);
+      if (ta === 54) w = u + Math.sin(u * Math.PI * 10) * 0.025;      // stop-and-go while withdrawing
+      if (ta === 84) w = u + Math.sin(u * Math.PI * 8) * 0.03;
+      let s = a + (b - a) * w;
+      if (ta === 23) s += 0.1 * Math.sin((tc - 23) * 2.6) * Math.sin(Math.PI * u);   // push-pull through the sigmoid
+      return s;
+    }
+  }
+  return KEYS[KEYS.length - 1][1];
+}
+const stepAt = (tc) => { for (let i = 0; i < STEPS.length; i++) if (tc < STEPS[i].t1) return i; return STEPS.length - 1; };
+const lineAt = (i, tc) => { let s = STEPS[i].lines[0][1]; for (const [t, l] of STEPS[i].lines) if (tc >= t) s = l; return s; };
+const roll = (tc) => smooth((tc - 12.5) / 2.5) * (1 - smooth((tc - 93.6) / 2.2));
+const ready = (tc) => smooth((tc - 15) / 1.5) * (1 - smooth((tc - 93.6) / 1.2));
+const dim = (tc) => 1 - 0.55 * smooth((tc - 15) / 2) * (1 - smooth((tc - 91) / 2));
+const aim = (tc) => smooth((tc - 68.4) / 1.6) * (1 - smooth((tc - 83.2) / 0.9));
+const sweep = (tc) => (tc > 53.5 && tc < 68.5 ? smooth((tc - 54) / 1) * (1 - smooth((tc - 67.3) / 0.8)) : tc > 84 && tc < 92 ? smooth((tc - 84.5) / 1) * (1 - smooth((tc - 90.5) / 1)) * 0.7 : 0);
+const POLY = ['AI 偵測到息肉', '調整位置', '伸出圈套器', '收緊線圈', '通電切除', '回收息肉', '夾上止血夾'];
+const polyPhase = (tc) => { const ts = [68, 70, 72.5, 75, 77, 79, 81]; let k = 0; ts.forEach((t, i) => { if (tc >= t) k = i; }); return POLY[k]; };
+return { T, STEPS, sigma, stepAt, lineAt, roll, ready, dim, aim, sweep, polyPhase };
+})();
+
+// ================= procedure room =================
+function buildRoom(scene, shared) {
+  const root = new THREE.Group(); scene.add(root);
+  const S = new THREE.Group(); root.add(S);       // static (merged)
+  const RX = 24, RZ = 16, RH = 27;
+  // floor, walls, ceiling
+  const ft = TX.floorTexture(); ft.repeat.set((RX * 2) / 6, (RZ * 2) / 6);
+  const floor = add(new THREE.PlaneGeometry(RX * 2, RZ * 2), std(0xffffff, 0.5, 0, { map: ft }), root);
+  floor.rotation.x = -Math.PI / 2; floor.castShadow = false;
+  const wt = TX.wallTexture();
+  const wall = (len, x, z, ry) => { const t = wt.clone(); t.needsUpdate = true; t.repeat.set(len / 8, 1); const m = add(new THREE.PlaneGeometry(len, RH), std(0xffffff, 0.85, 0, { map: t }), root, x, RH / 2, z); m.rotation.y = ry; m.castShadow = false; return m; };
+  wall(RX * 2, 0, -RZ, 0); wall(RX * 2, 0, RZ, Math.PI); wall(RZ * 2, -RX, 0, Math.PI / 2); wall(RZ * 2, RX, 0, -Math.PI / 2);
+  const ceil = add(new THREE.PlaneGeometry(RX * 2, RZ * 2), std(0xdfe6e8, 0.9, 0), root, 0, RH, 0, false); ceil.rotation.x = Math.PI / 2;
+  const panelGlow = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const frameM = std(0xcfd6da, 0.5, 0.3);
+  for (const x of [-14, -4.7, 4.7, 14]) for (const z of [-8, 0, 8]) {
+    add(new THREE.PlaneGeometry(5, 2.6), panelGlow, S, x, RH - 0.03, z, false).rotation.x = Math.PI / 2;
+    box(5.3, 0.1, 2.9, frameM, S, x, RH - 0.02, z, false);
+  }
+
+  // ---- examination bed (mattress top at y = 7.6, head towards +x) ----
+  const bedDark = std(0x2b3036, 0.5, 0.6), bedFrame = std(0xc9d0d6, 0.35, 0.7), matt = std(0x2d5f8a, 0.7, 0.05);
+  box(11, 0.6, 5, bedDark, S, 0, 0.5, 0);
+  for (const x of [-4.8, 4.8]) for (const z of [-2.1, 2.1]) cyl(0.3, 0.35, bedDark, S, x, 0.3, z, 'z', 12);
+  box(2.4, 5.2, 2.0, bedFrame, S, 0, 3.4, 0);
+  box(20.4, 0.45, 7.2, bedFrame, S, 0, 6.3, 0);
+  rbox(20, 1.0, 7, 0.3, matt, S, 0, 7.1, 0);
+  rbox(3.4, 1.0, 4.4, 0.35, std(0xeef2f5, 0.9), S, 6.6, 8.1, -0.4);
+  for (const x of [-6, 0, 6]) cyl(0.12, 1.6, bedFrame, S, x, 7.9, 3.75, 'y', 8);
+  cyl(0.13, 13, bedFrame, S, 0, 8.7, 3.75, 'x', 10);
+  box(0.6, 1.4, 3.4, bedDark, S, -10.4, 7.0, 0);
+
+  // ---- endoscopy tower: monitor, video processor, light source, CO2 insufflator ----
+  const tw = new THREE.Group(); tw.position.set(-12.5, 0, -2.5); tw.rotation.y = 1.85; S.add(tw);
+  const cartM = std(0xe8edf0, 0.4, 0.2), cartD = std(0x2a3036, 0.5, 0.5);
+  box(4.2, 0.4, 3.4, cartD, tw, 0, 0.6, 0);
+  for (const [x, z] of [[-1.8, -1.4], [1.8, -1.4], [-1.8, 1.4], [1.8, 1.4]]) cyl(0.28, 0.3, cartD, tw, x, 0.28, z, 'x', 10);
+  for (const x of [-1.9, 1.9]) box(0.25, 13, 0.25, cartM, tw, x, 7.1, -1.3);
+  for (const y of [3.0, 6.2, 9.4, 12.6]) box(4.2, 0.18, 3.2, cartM, tw, 0, y, 0);
+  const ledG = new THREE.MeshBasicMaterial({ color: new THREE.Color(0x40ff80).multiplyScalar(1.6) });
+  const ledB = new THREE.MeshBasicMaterial({ color: new THREE.Color(0x40c8ff).multiplyScalar(1.6) });
+  const dev = (y, h, col) => {
+    box(3.6, h, 2.6, std(col, 0.4, 0.3), tw, 0, y + h / 2 + 0.09, 0);
+    box(3.4, h * 0.6, 0.05, cartD, tw, 0, y + h / 2 + 0.09, 1.31);
+    box(0.9, 0.3, 0.02, ledB, tw, -1.0, y + h / 2 + 0.2, 1.345, false);
+    for (let i = 0; i < 3; i++) box(0.12, 0.12, 0.02, ledG, tw, 0.4 + i * 0.3, y + h / 2 + 0.2, 1.345, false);
+  };
+  dev(3.0, 1.6, 0xdfe5ea); dev(6.2, 1.9, 0xe9eef2); dev(9.4, 1.5, 0xe9eef2);
+  cyl(0.3, 0.3, cartD, tw, 1.1, 7.2, 1.4, 'z', 14);
+  const water = std(0xbfe4ff, 0.1, 0, { transparent: true, opacity: 0.55 });
+  cyl(0.42, 1.5, water, tw, 2.6, 3.85, 0.6, 'y', 16);
+  box(0.3, 2.6, 0.3, cartD, tw, 0, 14.0, -0.8);
+  box(7.4, 4.5, 0.35, cartD, tw, 0, 16.9, -0.6);
+  const screenBg = new THREE.MeshBasicMaterial({ color: 0x000000 });
+  add(new THREE.PlaneGeometry(7.0, 4.1), screenBg, tw, 0, 16.9, -0.42, false);
+  const monMat = new THREE.MeshBasicMaterial({ map: shared.endoTex, alphaMap: TX.maskTexture(), transparent: true });
+  const mon = add(new THREE.PlaneGeometry(3.9, 3.9), monMat, tw, 1.35, 16.9, -0.41, false); mon.userData.dyn = true;
+  add(new THREE.PlaneGeometry(1.9, 3.8), new THREE.MeshBasicMaterial({ map: TX.monitorSideTexture(), toneMapped: false }), tw, -2.2, 16.9, -0.41, false);
+  root.updateMatrixWorld(true);
+  const lightPort = tw.localToWorld(new V3(1.1, 7.2, 1.6));
+
+  // ---- vital-signs monitor on a wall arm near the head end ----
+  const vit = makeVitals();
+  const vg = new THREE.Group(); vg.position.set(14.5, 14.5, -9.5); vg.rotation.y = -0.75; S.add(vg);
+  box(5.6, 3.8, 0.5, cartD, vg, 0, 0, 0);
+  add(new THREE.PlaneGeometry(5.2, 3.25), new THREE.MeshBasicMaterial({ map: vit.tex, toneMapped: false }), vg, 0, 0, 0.26, false).userData.dyn = true;
+  box(0.4, 0.4, 6.0, cartD, vg, 0, 0, -3.2);
+
+  // ---- IV pole + bag ----
+  const ivX = 9.6, ivZ = 4.8;
+  for (let i = 0; i < 5; i++) { const a = i * 1.2566; box(1.6, 0.12, 0.2, cartD, S, ivX + Math.cos(a) * 0.8, 0.3, ivZ + Math.sin(a) * 0.8).rotation.y = -a; }
+  cyl(0.08, 19, bedFrame, S, ivX, 9.8, ivZ, 'y', 8);
+  cyl(0.04, 1.6, bedFrame, S, ivX, 19.2, ivZ, 'x', 6);
+  rbox(1.1, 2.0, 0.35, 0.15, std(0xdff3ff, 0.15, 0, { transparent: true, opacity: 0.6 }), S, ivX + 0.6, 17.6, ivZ);
+  const dripM = new THREE.MeshBasicMaterial({ color: 0x9fe0ff });
+  const drip = cyl(0.12, 0.5, dripM, root, ivX + 0.6, 16.1, ivZ, 'y', 10); drip.castShadow = false;
+  const ivMat = std(0xe8f6ff, 0.2, 0, { transparent: true, opacity: 0.7 });
+  const ivLine = add(new THREE.BufferGeometry(), ivMat, root, 0, 0, 0, false);
+
+  // ---- cabinets, sink, door, gas panel, instrument trolley ----
+  const cabM = std(0xe7ecee, 0.55, 0.05), cabD = std(0x7f8b92, 0.5, 0.4), topM = std(0x8a949b, 0.35, 0.3);
+  box(18, 8.4, 2.6, cabM, S, 12, 4.2, -RZ + 1.3); box(18.3, 0.35, 2.9, topM, S, 12, 8.55, -RZ + 1.45);
+  for (let x = 3.5; x < 21; x += 3) { box(0.05, 7.6, 0.05, cabD, S, x + 1.5, 4.4, -RZ + 2.62); box(1.0, 0.12, 0.1, cabD, S, x + 0.6, 7.2, -RZ + 2.66); }
+  box(18, 5, 1.6, cabM, S, 12, 19.6, -RZ + 0.8);
+  for (let x = 3.5; x < 21; x += 3) box(0.1, 1.0, 0.1, cabD, S, x + 2.7, 18.0, -RZ + 1.65);
+  box(3.2, 0.2, 1.8, cabD, S, 7, 8.7, -RZ + 1.4); cyl(0.12, 1.6, topM, S, 7, 9.5, -RZ + 0.6, 'y', 8);
+  box(5.2, 11.5, 0.4, std(0x6e8fa0, 0.55, 0.2), S, -RX + 0.2, 5.75, 8);
+  box(0.6, 12.1, 0.6, frameM, S, -RX + 0.3, 6.05, 5.1); box(0.6, 12.1, 0.6, frameM, S, -RX + 0.3, 6.05, 10.9); box(0.6, 0.6, 6.4, frameM, S, -RX + 0.3, 12.0, 8);
+  box(2.2, 1.6, 0.06, std(0xbfe0f0, 0.1, 0.2), S, -RX + 0.45, 8.8, 8.8).rotation.y = Math.PI / 2;
+  box(4.5, 1.6, 0.3, cabM, S, 16, 13.5, -RZ + 0.15);
+  for (const [i, c] of [[0, 0x2fbf5a], [1, 0xf0f0f0], [2, 0xf2c21b]].map(([i, c]) => [i, c])) cyl(0.25, 0.2, std(c, 0.4), S, 14.6 + i * 1.4, 13.5, -RZ + 0.35, 'z', 12);
+  const trol = new THREE.Group(); trol.position.set(5.2, 0, -7.4); trol.rotation.y = 0.2; S.add(trol);
+  box(3.4, 0.15, 2.0, bedFrame, trol, 0, 8.0, 0); box(3.4, 0.15, 2.0, bedFrame, trol, 0, 3.2, 0);
+  for (const [x, z] of [[-1.6, -0.9], [1.6, -0.9], [-1.6, 0.9], [1.6, 0.9]]) { cyl(0.07, 8, bedFrame, trol, x, 4.1, z, 'y', 6); cyl(0.2, 0.2, cartD, trol, x, 0.2, z, 'x', 8); }
+  box(3.0, 0.08, 1.7, std(0x2f8fa0, 0.7), trol, 0, 8.12, 0);
+  add(new THREE.TorusGeometry(0.45, 0.06, 6, 20), std(0x3a6fd0, 0.4), trol, -0.9, 8.22, 0.1).rotation.x = Math.PI / 2;
+  cyl(0.18, 0.9, std(0xf2f5f7, 0.3), trol, 0.3, 8.6, -0.3, 'y', 10); cyl(0.12, 1.2, std(0xf2f5f7, 0.3), trol, 0.8, 8.25, 0.4, 'x', 8);
+  cyl(0.3, 0.6, std(0xe8f4ff, 0.1, 0, { transparent: true, opacity: 0.6 }), trol, 1.2, 8.5, -0.4, 'y', 12);
+
+  // ---- staff: endoscopist behind the patient's back, nurse at the head ----
+  const glove = std(0x5f73d8, 0.55), skinM = std(0xd9ab8e, 0.7), maskM = std(0x9fc6e8, 0.8), shoe = std(0x30363c, 0.6);
+  // invisible low-poly stand-ins for the staff, used to keep 3D text off them (layer 5, never rendered)
+  const staffProxy = new THREE.Group(); root.add(staffProxy);
+  const proxyM = new THREE.MeshBasicMaterial();
+  const proxy = (m) => { m.visible = false; m.castShadow = m.receiveShadow = false; m.layers.set(5); return m; };
+  const person = (x, z, yaw, scrub, capM, handL, handR) => {
+    const g = new THREE.Group(); g.position.set(x, 0, z); g.rotation.y = yaw; S.add(g);
+    const pg = new THREE.Group(); pg.position.set(x, 0, z); pg.rotation.y = yaw; staffProxy.add(pg);
+    proxy(add(new THREE.BoxGeometry(2.8, 8.6, 1.8), proxyM, pg, 0, 4.3, 0));
+    proxy(add(new THREE.BoxGeometry(4.1, 6.4, 2.5), proxyM, pg, 0, 11.5, 0));
+    proxy(add(new THREE.BoxGeometry(2.5, 3.2, 2.6), proxyM, pg, 0, 15.9, 0.1));
+    for (const s of [-1, 1]) { limb(new V3(s * 0.75, 0.7, 0), new V3(s * 0.8, 8.4, 0), 0.6, scrub, g); box(1.0, 0.5, 1.9, shoe, g, s * 0.75, 0.25, 0.35); }
+    rbox(3.7, 5.8, 2.1, 0.7, scrub, g, 0, 11.5, 0);
+    cyl(0.45, 1.0, skinM, g, 0, 14.6, 0, 'y', 12);
+    const hd = sph(1.05, skinM, g, 0, 16.0, 0.05, 20); hd.scale.set(0.92, 1.05, 1);
+    add(new THREE.SphereGeometry(1.12, 20, 10, 0, Math.PI * 2, 0, Math.PI / 2), capM, g, 0, 16.2, -0.05);
+    rbox(1.6, 1.0, 0.4, 0.15, maskM, g, 0, 15.6, 0.95);
+    for (const s of [-1, 1]) {
+      const sh = new V3(s * 1.9, 13.8, 0), hand = s > 0 ? handL : handR;
+      const el = new V3().addVectors(sh, hand).multiplyScalar(0.5).add(new V3(s * 0.7, -1.3, -0.4));
+      limb(sh, el, 0.48, scrub, g); limb(el, hand, 0.36, glove, g); sph(0.42, glove, g, hand.x, hand.y, hand.z, 12);
+      proxy(limb(sh, el, 0.55, proxyM, pg)); proxy(limb(el, hand, 0.5, proxyM, pg));
+    }
+    return g;
+  };
+  const docX = -1.6, docZ = -5.8;
+  const hL = new V3(-0.4, 12.4, -3.8), hR = new V3(-2.1, 10.1, -2.9);       // world positions of the endoscopist's hands
+  person(docX, docZ, 0, std(0x2f7f8a, 0.85), std(0x2f6f9a, 0.8), hL.clone().sub(new V3(docX, 0, docZ)), hR.clone().sub(new V3(docX, 0, docZ)));
+  person(10.6, -5.2, -0.78, std(0x5a7fb8, 0.85), std(0xd9e6f2, 0.8), new V3(1.0, 10.6, 1.8), new V3(-1.0, 10.6, 1.8));
+  // endoscope control section (handle) in the left hand
+  const hmat = std(0x1b1f24, 0.4, 0.3), knob = std(0x3a4048, 0.4, 0.4);
+  const hg = new THREE.Group(); hg.position.copy(hL); hg.rotation.z = 0.15; S.add(hg);
+  cyl(0.42, 2.4, hmat, hg, 0, -0.1, 0, 'y', 16); cyl(0.2, 0.6, hmat, hg, 0, -1.6, 0, 'y', 12, 0.42);
+  cyl(0.62, 0.14, knob, hg, 0.5, 0.6, 0, 'x', 16); cyl(0.46, 0.14, knob, hg, 0.68, 0.6, 0, 'x', 16);
+  for (const y of [0.9, 0.55]) cyl(0.09, 0.2, std(0xd8dde2, 0.3), hg, -0.1, y, -0.4, 'z', 8);
+  proxy(add(new THREE.BoxGeometry(1.7, 3.4, 1.2), proxyM, staffProxy, hL.x + 0.2, hL.y - 0.3, hL.z));
+  root.updateMatrixWorld(true);
+  const handleBottom = hg.localToWorld(new V3(0, -1.9, 0)), cordOut = hg.localToWorld(new V3(-0.35, -0.9, -0.25));
+  // universal cord to the light source
+  const cord = new THREE.CatmullRomCurve3([cordOut, cordOut.clone().add(new V3(-1.5, -1.0, -1.4)), new V3(-6, 6.0, -6.4), new V3(-9.6, 5.0, -5.2), lightPort.clone().add(new V3(0.6, -0.3, -0.6)), lightPort]);
+  add(new THREE.TubeGeometry(cord, 80, 0.12, 8), std(0x1c2026, 0.4, 0.3), S, 0, 0, 0, true);
+
+  mergeStatic(S);
+
+  // ---- lights ----
+  const lamps = [];
+  for (const [x, z] of [[-9, -6], [9, -6], [-9, 6], [9, 6]]) {
+    const pl = new THREE.PointLight(0xf2f6ff, 150, 46, 1.6); pl.position.set(x, RH - 1.5, z); root.add(pl); lamps.push(pl);
+  }
+  const rig = {
+    rightHand: hR.clone(), handleBottom,
+    loopA: new V3(-1.6, 9.2, -3.6), loopB: new V3(-0.75, 9.7, -3.95),
+    rest0: hR.clone().add(new V3(0.5, -2.2, -0.4)), rest1: hR.clone().add(new V3(0.15, -0.9, -0.15)),
+  };
+  let frameN = 0;
+  return {
+    lamps, rig, staffProxy,
+    update(tc, t, patient) {
+      const d = TL.dim(tc);
+      panelGlow.color.setRGB(2.3 * d, 2.35 * d, 2.45 * d);
+      for (const l of lamps) l.intensity = 150 * d;
+      const sed = smooth((tc - 11.5) / 2) * (1 - smooth((tc - 92) / 3));
+      dripM.color.setHex(0x9fe0ff).multiplyScalar(sed > 0.05 && Math.sin(t * 6) > 0.6 ? 2.2 : 1);
+      if ((frameN++ & 1) === 0) {
+        const pain = tc > 25 && tc < 32 ? 1 : 0;
+        const hr = 76 - 8 * sed + 9 * pain + Math.sin(t * 0.3) * 1.5;
+        vit.draw(t, hr, 98 - Math.round(sed), Math.round(122 - 10 * sed) + '/' + Math.round(78 - 6 * sed), 14 - 2 * sed);
+      }
+      // IV line to the patient's upper hand
+      const hand = patient.ivHand;
+      const g = new THREE.TubeGeometry(new THREE.CatmullRomCurve3([new V3(ivX + 0.6, 15.8, ivZ), new V3(ivX - 0.4, 11.5, ivZ - 0.2), new V3((ivX + hand.x) / 2, Math.min(hand.y, 9.5) - 0.8, (ivZ + hand.z) / 2 + 0.6), hand]), 30, 0.05, 5);
+      ivLine.geometry.dispose(); ivLine.geometry = g;
+    },
+  };
+}
+
+// vital-sign monitor drawn on a canvas each frame
+function makeVitals() {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 320;
+  const g = c.getContext('2d');
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const ecg = (p) => { p -= Math.floor(p); const e = (c0, w) => Math.exp(-(((p - c0) / w) ** 2)); return 0.12 * e(0.12, 0.035) - 0.12 * e(0.29, 0.012) + 1.0 * e(0.31, 0.011) - 0.28 * e(0.335, 0.012) + 0.26 * e(0.56, 0.06); };
+  const pleth = (p) => { p -= Math.floor(p); return Math.exp(-(((p - 0.25) / 0.09) ** 2)) + 0.35 * Math.exp(-(((p - 0.5) / 0.08) ** 2)); };
+  const resp = (p) => 0.5 + 0.5 * Math.sin(p * Math.PI * 2);
+  const W = 320;
+  function trace(fn, col, y0, amp, phase) {
+    g.strokeStyle = col; g.lineWidth = 3; g.beginPath();
+    for (let x = 0; x <= W; x += 2) { const v = fn(phase - (W - x) / 105); if (x === 0) g.moveTo(12 + x, y0 - v * amp); else g.lineTo(12 + x, y0 - v * amp); }
+    g.stroke();
+  }
+  return {
+    tex: t,
+    draw(time, hr, spo2, bp, rr) {
+      g.fillStyle = '#02070a'; g.fillRect(0, 0, 512, 320);
+      g.strokeStyle = 'rgba(40,90,100,0.3)'; g.lineWidth = 1;
+      for (let x = 12; x < 340; x += 26) { g.beginPath(); g.moveTo(x, 10); g.lineTo(x, 310); g.stroke(); }
+      trace(ecg, '#46ff7a', 100, 70, time * hr / 60);
+      trace(pleth, '#38d8ff', 200, 48, time * hr / 60 - 0.2);
+      trace(resp, '#ffd84a', 292, 34, time * rr / 60);
+      g.fillStyle = '#46ff7a'; g.font = `600 22px ${FONT}`; g.fillText('心跳', 352, 34);
+      g.font = `700 64px ${FONT}`; g.fillText(String(Math.round(hr)), 352, 96);
+      g.fillStyle = '#38d8ff'; g.font = `600 22px ${FONT}`; g.fillText('血氧 %', 352, 136);
+      g.font = `700 52px ${FONT}`; g.fillText(String(spo2), 352, 190);
+      g.fillStyle = '#ffffff'; g.font = `600 20px ${FONT}`; g.fillText('血壓', 352, 226);
+      g.font = `700 30px ${FONT}`; g.fillText(bp, 352, 260);
+      g.fillStyle = '#ffd84a'; g.font = `600 20px ${FONT}`; g.fillText('呼吸 ' + Math.round(rr), 352, 298);
+      t.needsUpdate = true;
+    },
+  };
+}
+
+// ================= patient, colon, endoscope =================
+function buildPatient(scene, shared, rig) {
+  const root = new THREE.Group(); scene.add(root);           // rolls about the head-foot (x) axis
+  const anat = new THREE.Group(); root.add(anat);
+  anat.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(new V3(0, 0, 1), new V3(1, 0, 0), new V3(0, 1, 0)));
+  const onlyEndo = (o) => { o.layers.set(2); return o; };
+  const both = (o) => { o.layers.enable(2); return o; };
+
+  // ---------- body (x-ray look) ----------
+  const skin = fresnelMat(0x7cc4ff, 2.1, 0.025, 0.85);
+  const body = new THREE.Group(); anat.add(body);
+  const part = (geo, x, y, z, sx = 1, sy = 1, sz = 1, parent = body) => { const m = add(geo, skin, parent, x, y, z, false); m.scale.set(sx, sy, sz); m.renderOrder = 8; return m; };
+  part(new THREE.CapsuleGeometry(1, 3.4, 8, 28), 0, 0.8, -0.05, 1.65, 1, 1.0);
+  part(new THREE.SphereGeometry(1, 28, 18), 0, 2.7, 0, 1.8, 1.1, 1.02);
+  for (const s of [-1, 1]) part(new THREE.SphereGeometry(0.78, 20, 14), s * 0.6, -1.45, -0.42);
+  part(new THREE.CylinderGeometry(0.42, 0.5, 0.9, 16), 0, 3.8, 0.05);
+  part(new THREE.SphereGeometry(0.95, 24, 18), 0, 4.75, 0.15, 0.85, 1.05, 1);
+  const limbP = (a, b, r, parent = body) => { const m = limb(a, b, r, skin, parent); m.castShadow = m.receiveShadow = false; m.renderOrder = 8; return m; };
+  for (const s of [-1, 1]) { const sh = new V3(s * 1.6, 3.1, 0), el = new V3(s * 1.15, 1.7, 1.25), ha = new V3(s * 0.65, 2.0, 2.35); limbP(sh, el, 0.34); limbP(el, ha, 0.28); }
+  const ivHandLocal = new V3(-0.65, 2.0, 2.35);
+  const legs = [-1, 1].map((s) => {
+    const hip = new THREE.Group(); hip.position.set(s * 0.72, -1.45, 0.0); body.add(hip);
+    limbP(new V3(0, 0, 0), new V3(0, -4.2, 0), 0.66, hip);
+    const knee = new THREE.Group(); knee.position.set(0, -4.2, 0); hip.add(knee);
+    limbP(new V3(0, 0, 0), new V3(0, -4.0, 0), 0.45, knee);
+    part(new THREE.SphereGeometry(0.42, 14, 10), 0, -4.3, 0.35, 0.9, 0.6, 1.6, knee);
+    return { hip, knee, s };
+  });
+  const liver = add(new THREE.SphereGeometry(1, 24, 16), fresnelMat(0xd0644a, 1.8, 0.06, 0.9), anat, -0.62, 1.85, 0.05, false);
+  liver.scale.set(1.05, 0.6, 0.8); liver.rotation.z = -0.3; liver.renderOrder = 7;
+
+  // ---------- colon: translucent outer wall (seen from the room) ----------
+  const pink = new THREE.Color(0xff9d8a), brown = new THREE.Color(0x8a5a2a);
+  const colonMat = std(0xff9d8a, 0.42, 0, { transparent: true, opacity: 0.46, depthWrite: false, emissive: 0x40120c });
+  const outerGeo = A.tube(560, 30, A.rOut, false, 1.6);
+  const colon = add(outerGeo, colonMat, anat, 0, 0, 0, false); colon.renderOrder = 3;
+  const rim = add(outerGeo, fresnelMat(0xffb39c, 2.4, 0.0, 0.8), anat, 0, 0, 0, false); rim.renderOrder = 4;
+  const endP = new V3(), endT = new V3();
+  A.frameAt(1, endP, endT);
+  const Rend = A.radiusAt(1);
+  const capO = add(new THREE.SphereGeometry(Rend * 1.04, 24, 12, 0, Math.PI * 2, 0, Math.PI / 2), colonMat, anat, endP.x, endP.y, endP.z, false);
+  capO.quaternion.setFromUnitVectors(new V3(0, 1, 0), endT); capO.renderOrder = 3;
+  // appendix stub
+  const appx = add(new THREE.CapsuleGeometry(0.06, 0.5, 4, 10), colonMat, anat, 0, 0, 0, false);
+  appx.position.copy(endP).add(new V3(0.05, -0.32, 0.05)); appx.rotation.z = -0.5; appx.renderOrder = 3;
+
+  // ---------- colon: inner mucosa (seen only by the endoscope camera, layer 2) ----------
+  const mucTex = TX.mucosaTexture();
+  const muc = new THREE.MeshPhysicalMaterial({ map: mucTex, roughness: 0.5, clearcoat: 1, clearcoatRoughness: 0.12, envMapIntensity: 0, fog: false });
+  onlyEndo(add(A.tube(1300, 52, A.rIn, true, 1.6), muc, anat, 0, 0, 0, false));
+  const mucCap = muc.clone(); mucCap.side = THREE.BackSide;
+  const capI = onlyEndo(add(new THREE.SphereGeometry(Rend, 48, 20, 0, Math.PI * 2, 0, Math.PI / 2), mucCap, anat, endP.x, endP.y, endP.z, false));
+  capI.quaternion.setFromUnitVectors(new V3(0, 1, 0), endT); capI.scale.y = 0.8;
+  const eP = new V3(), eT = new V3(), eN = new V3(), eB = new V3();
+  A.frameAt(0.995, eP, eT, eN, eB);
+  {   // appendiceal orifice on the caecal pole (crescent fold + dark opening)
+    const d = new V3().copy(endT).multiplyScalar(0.72).addScaledVector(eN, 0.69).normalize();
+    const p = endP.clone().addScaledVector(d, Rend * 0.93 * (0.8 + 0.2 * Math.abs(d.dot(endT))));
+    const hole = onlyEndo(add(new THREE.CircleGeometry(0.045, 20), new THREE.MeshPhysicalMaterial({ color: 0x5a1814, roughness: 0.4, clearcoat: 1, fog: false, envMapIntensity: 0 }), anat, p.x, p.y, p.z, false));
+    hole.lookAt(anat.localToWorld(endP.clone())); hole.scale.set(1, 0.55, 1);
+    const ring = onlyEndo(add(new THREE.TorusGeometry(0.06, 0.018, 8, 20, Math.PI * 1.3), muc, anat, p.x, p.y, p.z, false));
+    ring.quaternion.copy(hole.quaternion);
+  }
+  {   // ileocaecal valve: a lip-like fold on the wall just before the pole
+    const s = 1 - 0.32 / A.L, P = new V3(), Tg = new V3(), N = new V3(), B = new V3();
+    A.frameAt(s, P, Tg, N, B);
+    const d = N.clone().negate();
+    const p = P.clone().addScaledVector(d, A.rIn(s, Math.PI) * 0.97);
+    for (const k of [-1, 1]) {
+      const lip = onlyEndo(add(new THREE.CapsuleGeometry(0.028, 0.11, 6, 12), new THREE.MeshPhysicalMaterial({ color: 0xf0a088, roughness: 0.45, clearcoat: 1, fog: false, envMapIntensity: 0 }), anat, 0, 0, 0, false));
+      lip.position.copy(p).addScaledVector(Tg, k * 0.045);
+      lip.quaternion.setFromUnitVectors(new V3(0, 1, 0), B);
+    }
+  }
+
+  // ---------- polyp (pedunculated) ----------
+  const pP = new V3(), pT = new V3(), pN = new V3(), pB = new V3();
+  A.frameAt(A.polyp.s, pP, pT, pN, pB);
+  const pdir = pN.clone().multiplyScalar(Math.cos(A.polyp.th)).addScaledVector(pB, Math.sin(A.polyp.th)).normalize();   // from axis to wall
+  const pAxis = pdir.clone().negate();                                                                                    // stalk points into the lumen
+  const pBase = pP.clone().addScaledVector(pdir, A.rIn(A.polyp.s, A.polyp.th) * 0.985);
+  const pg = new THREE.Group(); pg.position.copy(pBase); pg.quaternion.setFromUnitVectors(new V3(0, 1, 0), pAxis); anat.add(pg);
+  pg.updateMatrix();
+  const pgInv = pg.matrix.clone().invert();
+  const polypMat = new THREE.MeshPhysicalMaterial({ color: 0xd2665a, map: mucTex, roughness: 0.42, clearcoat: 1, clearcoatRoughness: 0.15, envMapIntensity: 0, fog: false });
+  const stalk = both(add(new THREE.CylinderGeometry(0.022, 0.03, 0.1, 16).translate(0, 0.05, 0), polypMat, pg, 0, 0, 0, false));
+  const headGeo = new THREE.SphereGeometry(0.062, 32, 22);
+  { const p = headGeo.attributes.position; for (let i = 0; i < p.count; i++) { const v = new V3().fromBufferAttribute(p, i), n = v.clone().normalize(); const k = 1 + 0.07 * Math.sin(n.x * 9) * Math.sin(n.y * 8 + 1) * Math.sin(n.z * 7 + 2) + 0.05 * Math.sin(n.x * 17 + n.z * 13); v.multiplyScalar(k); p.setXYZ(i, v.x, v.y, v.z); } headGeo.computeVertexNormals(); }
+  const headMat = polypMat.clone(); headMat.color.setHex(0xc85048);
+  const headHome = new V3(0, 0.145, 0);
+  const head = both(add(headGeo, headMat, pg, headHome.x, headHome.y, headHome.z, false));
+  const headAnat = headHome.clone().applyMatrix4(pg.matrix);
+  const stalkAnat = new V3(0, 0.05, 0).applyMatrix4(pg.matrix);
+  const burn = onlyEndo(add(new THREE.CircleGeometry(0.026, 18), new THREE.MeshPhysicalMaterial({ color: 0xf2e6c8, roughness: 0.6, fog: false, envMapIntensity: 0 }), pg, 0, 0.042, 0, false));
+  burn.rotation.x = -Math.PI / 2;
+
+  // ---------- snare, clip, water jet, steam, AI box (endoscope view) ----------
+  const snareM = std(0xd8dde2, 0.28, 0.6, { emissive: 0xff7a2a, emissiveIntensity: 0, envMapIntensity: 0, fog: false });
+  const sheathM = std(0xcfe2f2, 0.3, 0, { envMapIntensity: 0, fog: false });
+  const unitCyl = (r) => new THREE.CylinderGeometry(r, r, 1, 10).translate(0, 0.5, 0);
+  const sheath = onlyEndo(add(unitCyl(0.008), sheathM, anat, 0, 0, 0, false));
+  const loop = onlyEndo(add(new THREE.TorusGeometry(1, 0.06, 6, 56), snareM, anat, 0, 0, 0, false));
+  const appl = onlyEndo(add(unitCyl(0.009), std(0x3a7bd0, 0.35, 0, { envMapIntensity: 0, fog: false }), anat, 0, 0, 0, false));
+  const clipM = std(0xc8d0d8, 0.25, 0.8, { envMapIntensity: 0, fog: false });
+  const clip = new THREE.Group(); pg.add(clip);
+  onlyEndo(add(new THREE.CylinderGeometry(0.012, 0.012, 0.05, 10).translate(0, -0.025, 0), clipM, clip, 0, 0, 0, false));
+  const prongs = [-1, 1].map((s) => { const h = new THREE.Group(); clip.add(h); onlyEndo(add(new THREE.BoxGeometry(0.006, 0.055, 0.012).translate(0, 0.0275, 0), clipM, h, 0, 0, 0, false)); h.userData.s = s; return h; });
+  const dropM = std(0xdff2ff, 0.05, 0, { transparent: true, opacity: 0.7, emissive: 0x405060, envMapIntensity: 0, fog: false });
+  const NDROP = 22, drops = onlyEndo(new THREE.InstancedMesh(new THREE.SphereGeometry(1, 8, 6), dropM, NDROP)); anat.add(drops);
+  const steamTex = TX.smokeTexture();
+  const steam = [0, 1, 2, 3, 4].map(() => { const s = onlyEndo(new THREE.Sprite(new THREE.SpriteMaterial({ map: steamTex, color: 0xffffff, transparent: true, depthWrite: false, fog: false }))); anat.add(s); return s; });
+  const cutGlow = onlyEndo(new THREE.Sprite(new THREE.SpriteMaterial({ map: shared.glowTex, color: 0xffb060, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false, fog: false }))); anat.add(cutGlow);
+  const cade = onlyEndo(new THREE.Sprite(new THREE.SpriteMaterial({ map: TX.cadeTexture(), color: 0x5dff86, transparent: true, depthTest: false, depthWrite: false, fog: false })));
+  cade.renderOrder = 30; cade.position.copy(headAnat); anat.add(cade);
+
+  // ---------- endoscope: insertion tube inside the colon + outside part to the handle ----------
+  const scopeMat = std(0x16191d, 0.3, 0.35);
+  const scopeInMat = std(0x2a3a4a, 0.3, 0.3, { emissive: 0x0a2a44, emissiveIntensity: 1.5 });
+  const SEGS = 760;
+  const scopeIn = add(new THREE.TubeGeometry(A.curve, SEGS, 0.085, 8, false), scopeInMat, anat, 0, 0, 0, false);
+  scopeIn.renderOrder = 1;
+  const tipCap = add(new THREE.SphereGeometry(0.08, 14, 10), scopeMat, anat, 0, 0, 0, false);
+  const tipGlow = new THREE.Sprite(new THREE.SpriteMaterial({ map: shared.glowTex, color: 0xfff1d8, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false, fog: false }));
+  tipGlow.scale.setScalar(1.6); tipGlow.renderOrder = 9; anat.add(tipGlow);
+  const tipLight = new THREE.PointLight(0xfff0dc, 0, 4.5, 2); anat.add(tipLight);
+  const extMesh = add(new THREE.BufferGeometry(), scopeMat, scene, 0, 0, 0, true);
+  const anusP = A.C[0].clone(), outDir = A.fr.tangents[0].clone().negate();
+
+  // endoscope camera + its light (layer 2 only)
+  const endoCam = new THREE.PerspectiveCamera(100, 1, 0.006, 14);
+  endoCam.layers.set(2); anat.add(endoCam);
+  const endoLight = new THREE.PointLight(0xfff4ea, 0.24, 0, 2); endoLight.layers.set(2); endoCam.add(endoLight);
+
+  // ---------- bowel-prep debris (step 1) ----------
+  const ND = 150, dr = TX.rng(7);
+  const debris = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 0), std(0x6b4a22, 0.8), ND); anat.add(debris);
+  const ddef = []; for (let i = 0; i < ND; i++) ddef.push({ s: 0.08 + dr() * 0.9, a: dr() * 6.28, r: dr() * 0.55, k: 0.5 + dr() * 0.5, sz: 0.05 + dr() * 0.06 });
+
+  // ---------- labels ----------
+  const LBL = [[0.75, -1.75, 0.1], [-0.05, 0.05, 0.95], [1.9, 0.15, 0.0], [1.6, 1.85, 0.0], [0.05, 1.35, 0.8], [-1.75, 1.75, 0.0], [-1.95, 0.3, 0.0], [-1.6, -1.1, 0.3]];
+  const labels = A.SEG.map((sg, i) => {
+    const m = new THREE.SpriteMaterial({ map: TX.labelTexture(sg.name, '#ff9d8a'), transparent: true, depthTest: false, depthWrite: false, fog: false });
+    const s = new THREE.Sprite(m); s.position.set(...LBL[i]); s.scale.set(1.9, 0.475, 1); s.renderOrder = 20; anat.add(s); return s;
+  });
+  const extraLabel = (text, col, pos, sc = 1) => { const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: TX.labelTexture(text, col), transparent: true, depthTest: false, depthWrite: false, fog: false })); s.position.copy(pos); s.scale.set(1.9 * sc, 0.475 * sc, 1); s.renderOrder = 21; anat.add(s); return s; };
+  const liverLbl = extraLabel('肝臟', '#d0644a', new V3(-0.7, 2.6, 0.4), 0.9);
+  const pressLbl = extraLabel('助手按壓腹部', '#ffc040', new V3(0.3, 0.55, 1.6), 1.15);
+  const zzz = extraLabel('鎮靜中 Zzz', '#9fd0ff', new V3(0.2, 5.9, 0.9), 1.1);
+  const prepLbl = extraLabel('清腸：把糞便排乾淨', '#e0b060', new V3(0.0, -2.75, 0.8), 1.25);
+  const ringM = new THREE.MeshBasicMaterial({ color: new THREE.Color(0xffc040).multiplyScalar(1.6), transparent: true, blending: THREE.AdditiveBlending, depthWrite: false });
+  const pressRing = add(new THREE.TorusGeometry(0.45, 0.05, 8, 40), ringM, anat, 0.25, -0.3, 1.1, false);
+
+  // ---------- update ----------
+  const P = new V3(), Tn = new V3(), Nn = new V3(), Bn = new V3(), tgt = new V3(), up = new V3(), tmp = new V3(), tmp2 = new V3();
+  const m4 = new THREE.Matrix4(), ax = new V3(), ay = new V3(), az = new V3(), ch = new V3(), dm = new THREE.Object3D();
+  const tipP = new V3(), info = { inside: false, depth: 0, seg: '', segIdx: -1, tipWorld: new V3(), ivHand: new V3(), cade: false, sig: 0 };
+  const nominalCh = new V3(); A.frameAt((A.polyp.l - 0.4) / A.L, nominalCh); nominalCh.applyMatrix4(pgInv);
+  const stump = new V3(0, 0.042, 0);
+  const clipDir = stump.clone().sub(nominalCh).normalize();
+  const show = { labels: true, ai: true, body: true };
+  const headCol = new THREE.Color(0xc85048), headPale = new THREE.Color(0xf0d6c8);
+
+  let update = function (tc, t) {
+    const rl = TL.roll(tc);
+    root.rotation.x = rl * Math.PI / 2;
+    root.position.set(1.5, 8.8 + 0.6 * rl, -0.6 * rl);
+    for (const lg of legs) { lg.hip.rotation.set(-1.25 * rl, 0, (lg.s > 0 ? 0.14 : 0.05) * rl); lg.knee.rotation.x = 1.45 * rl; }
+    body.visible = show.body;
+    root.updateMatrixWorld(true);
+    info.ivHand.copy(ivHandLocal); anat.localToWorld(info.ivHand);
+
+    // insertion depth along the colon
+    const sig = TL.sigma(tc), inside = sig > 0.0005, f = clamp01(sig / A.L);
+    info.sig = sig; info.inside = inside; info.depth = Math.max(0, sig) * 10;
+    scopeIn.geometry.setDrawRange(0, Math.floor(f * SEGS) * 8 * 6);
+    if (inside) A.frameAt(f, tipP); else tipP.copy(anusP).addScaledVector(outDir, -sig);
+    const rd = TL.ready(tc);
+    tipCap.position.copy(tipP); tipCap.visible = rd > 0.98;
+    tipGlow.position.copy(tipP); tipGlow.visible = rd > 0.98;
+    tipGlow.material.opacity = inside ? 1 : 0.6;
+    tipLight.position.copy(tipP); tipLight.intensity = inside ? 2.4 : 0;
+    info.tipWorld.copy(tipP); anat.localToWorld(info.tipWorld);
+    info.segIdx = inside ? A.segAt(f) : -1; info.seg = inside ? A.SEG[info.segIdx].name : '';
+
+    // outside part of the insertion tube: anus (or tip) -> endoscopist's right hand -> handle
+    const w0 = anat.localToWorld(tmp.copy(inside ? anusP : tipP));
+    const w1 = anat.localToWorld(tmp2.copy(inside ? anusP : tipP).addScaledVector(outDir, 1.1));
+    const p0 = rig.rest0.clone().lerp(w0, rd), p1 = rig.rest1.clone().lerp(w1, rd);
+    const ext = new THREE.CatmullRomCurve3([p0, p1, rig.rightHand, rig.loopA, rig.loopB, rig.handleBottom]);
+    extMesh.geometry.dispose(); extMesh.geometry = new THREE.TubeGeometry(ext, 70, 0.075, 8);
+
+    // ---- endoscope camera pose ----
+    const aim = TL.aim(tc);
+    if (inside) {
+      A.frameAt(f, P, Tn, Nn, Bn);
+      A.frameAt(f + 0.6 / A.L, tgt);
+      up.copy(Nn);
+      tgt.addScaledVector(Bn, Math.sin(t * 0.9) * 0.04).addScaledVector(Nn, Math.cos(t * 0.7) * 0.03);
+      const sw = TL.sweep(tc);
+      if (sw > 0) { const ph = t * 1.5; tgt.addScaledVector(Nn, Math.cos(ph) * 0.16 * sw).addScaledVector(Bn, Math.sin(ph) * 0.16 * sw); }
+      if (aim > 0) { tmp.copy(headAnat).addScaledVector(pAxis, 0.075); tgt.lerp(tmp, aim); up.lerp(pAxis, aim).normalize(); }
+      m4.lookAt(P, tgt, up);
+      endoCam.position.copy(P); endoCam.quaternion.setFromRotationMatrix(m4);
+      m4.extractBasis(ax, ay, az);
+      ch.copy(P).addScaledVector(ax, 0.03).addScaledVector(ay, -0.032).addScaledVector(az, -0.012);   // working channel at 5 o'clock
+    }
+
+    // ---- polypectomy (stateless, driven by the clock) ----
+    const cutDone = tc >= 78.6 && tc < TL.T;
+    stalk.scale.y = cutDone ? 0.42 : 1;
+    burn.visible = cutDone;
+    const burnK = smooth((tc - 77) / 1.5);
+    headMat.color.copy(headCol).lerp(headPale, burnK * 0.6);
+    const rt = smooth((tc - 79.2) / 1.3);
+    if (tc < 79.2) { head.visible = true; head.position.copy(headHome); head.scale.setScalar(1); }
+    else if (tc < 80.5 && inside) { tmp.copy(ch).applyMatrix4(pgInv); head.position.lerpVectors(headHome, tmp, rt); head.scale.setScalar(1 - 0.65 * rt); head.visible = true; }
+    else head.visible = false;
+    // snare: sheath out, loop opens in front of the head, slides down to the stalk, tightens, cuts, retracts
+    const snOn = inside && tc >= 72.5 && tc < 80.4;
+    sheath.visible = loop.visible = snOn;
+    if (snOn) {
+      const front = tmp.copy(headAnat).addScaledVector(tmp2.copy(ch).sub(headAnat).normalize(), 0.17).clone();
+      const tOpen = smooth((tc - 73.5) / 0.9), tDown = smooth((tc - 74.3) / 0.9), tTight = smooth((tc - 75.2) / 1.6), tBack = smooth((tc - 79.0) / 1.2);
+      const loopC = front.clone().lerp(stalkAnat, tDown);
+      let loopR = (0.006 + 0.104 * tOpen - 0.078 * tTight) * (1 - tBack) + 0.004 * tBack;
+      const u = ch.clone().sub(loopC); u.addScaledVector(pAxis, -u.dot(pAxis));
+      if (u.lengthSq() < 1e-8) u.copy(ax); u.normalize();
+      const attach = loopC.clone().addScaledVector(u, loopR);
+      const ex = smooth((tc - 72.5) / 1.0);
+      let end = ch.clone().lerp(attach, ex);
+      if (tBack > 0) { end = attach.clone().lerp(ch, tBack); loopC.copy(end).addScaledVector(u, -loopR); }
+      const d = end.clone().sub(ch), len = Math.max(0.001, d.length());
+      sheath.position.copy(ch); sheath.quaternion.setFromUnitVectors(new V3(0, 1, 0), d.normalize()); sheath.scale.set(1, len, 1);
+      loop.position.copy(loopC); loop.quaternion.setFromUnitVectors(new V3(0, 0, 1), pAxis); loop.scale.setScalar(Math.max(0.004, loopR));
+      const cutting = tc > 77 && tc < 78.8;
+      snareM.emissiveIntensity = cutting ? 2.5 + 2.5 * Math.abs(Math.sin(t * 60) * Math.sin(t * 23)) : 0;
+      cutGlow.visible = cutting; cutGlow.position.copy(loopC); cutGlow.scale.setScalar(0.12 + 0.06 * Math.abs(Math.sin(t * 40)));
+    } else cutGlow.visible = false;
+    steam.forEach((s, k) => {
+      const age = tc - 77.1 - k * 0.32;
+      s.visible = inside && age > 0 && age < 1.5 && tc < 80;
+      if (!s.visible) return;
+      s.position.copy(stalkAnat).addScaledVector(pAxis, 0.03 + age * 0.13).addScaledVector(ax, Math.sin(k * 2.1) * 0.03 * age);
+      s.scale.setScalar(0.05 + age * 0.12); s.material.opacity = 0.55 * (1 - age / 1.5);
+    });
+    // haemostatic clip
+    const clipOn = tc >= 81 && tc < TL.T;
+    clip.visible = clipOn;
+    appl.visible = inside && tc >= 81 && tc < 83.8;
+    if (clipOn) {
+      const mv = smooth((tc - 81.2) / 1.3);
+      const startL = inside ? tmp.copy(ch).applyMatrix4(pgInv).clone() : nominalCh.clone();
+      const restP = stump.clone().addScaledVector(clipDir, -0.06);
+      clip.position.copy(startL).lerp(restP, tc < 83 ? mv : 1);
+      clip.quaternion.setFromUnitVectors(new V3(0, 1, 0), clipDir);
+      const open = smooth((tc - 81.3) / 0.5) * (1 - smooth((tc - 82.7) / 0.4));
+      for (const h of prongs) h.rotation.z = h.userData.s * (0.06 + 0.5 * open);
+      if (appl.visible) {
+        const cb = clip.position.clone().applyMatrix4(pg.matrix);
+        const d = cb.clone().sub(ch), len = Math.max(0.001, d.length() - 0.03);
+        appl.position.copy(ch); appl.quaternion.setFromUnitVectors(new V3(0, 1, 0), d.normalize()); appl.scale.set(1, len * (1 - smooth((tc - 83) / 0.8)), 1);
+      }
+    }
+    // water jet while washing (withdrawal)
+    const jet = inside && tc > 59 && tc < 61.6;
+    drops.visible = jet;
+    if (jet) {
+      const port = tmp.copy(P).addScaledVector(ax, -0.028).addScaledVector(ay, 0.03);
+      for (let i = 0; i < NDROP; i++) {
+        const u = (tc * 2.4 + i / NDROP) % 1, sp = Math.sin(i * 12.9898) * 0.5;
+        dm.position.copy(port).addScaledVector(az, -(0.08 + u * 0.75)).addScaledVector(ax, sp * u * 0.06).addScaledVector(ay, (Math.cos(i * 4.1) * 0.5 - u * 0.4) * u * 0.08);
+        dm.scale.setScalar(0.004 + 0.003 * u); dm.updateMatrix(); drops.setMatrixAt(i, dm.matrix);
+      }
+      drops.instanceMatrix.needsUpdate = true;
+    }
+    // AI detection box
+    info.cade = show.ai && inside && tc > 68.2 && tc < 77;
+    cade.visible = info.cade;
+    cade.scale.setScalar(0.2 + 0.01 * Math.sin(t * 6));
+    cade.material.opacity = 0.75 + 0.25 * Math.sin(t * 8);
+
+    // ---- room-side cues ----
+    const prep = tc < 9.2 ? 1 : 0;
+    colonMat.color.copy(brown).lerp(pink, prep ? smooth((tc - 1.5) / 6.5) : 1);
+    debris.visible = prep > 0;
+    if (prep) {
+      const p = smooth((tc - 1) / 6.5);
+      for (let i = 0; i < ND; i++) {
+        const d = ddef[i], s = d.s - p * 1.25 * d.k;
+        A.frameAt(Math.max(0, s), P, Tn, Nn, Bn);
+        const r = A.radiusAt(Math.max(0, s)) * d.r;
+        dm.position.copy(P).addScaledVector(Nn, Math.cos(d.a) * r).addScaledVector(Bn, Math.sin(d.a) * r);
+        dm.rotation.set(d.a, d.k * 3, 0); dm.scale.setScalar(s > 0.015 ? d.sz * (1 - 0.4 * p) : 0); dm.updateMatrix();
+        debris.setMatrixAt(i, dm.matrix);
+      }
+      debris.instanceMatrix.needsUpdate = true;
+    }
+    labels.forEach((s, i) => { s.visible = show.labels; s.material.opacity = i === info.segIdx ? 1 : 0.7; s.scale.set(i === info.segIdx ? 2.4 : 1.8, i === info.segIdx ? 0.6 : 0.45, 1); });
+    for (const l of [liverLbl, pressLbl, zzz, prepLbl]) l.material.opacity = 1;
+    liverLbl.visible = show.labels && tc > 39 && tc < 54;
+    const pr = tc > 25.5 && tc < 31.5;
+    pressRing.visible = pressLbl.visible = pr;
+    if (pr) { const k = 0.5 + 0.5 * Math.sin(t * 5); pressRing.scale.setScalar(0.85 + 0.25 * k); ringM.opacity = 0.5 + 0.5 * k; }
+    zzz.visible = tc > 12.5 && tc < 91; zzz.position.y = 5.9 + Math.sin(t * 1.4) * 0.12;
+    prepLbl.visible = show.labels && tc < 8.6;
+    return info;
+  };
+  const allLabels = [...labels, liverLbl, pressLbl, zzz, prepLbl];
+  // in the wide room views, let people/equipment hide the labels behind them
+  for (const l of allLabels) { l.userData.fade = 1; l.userData.base = 1; }
+  return { root, anat, endoCam, update, info, show, allLabels };
+}
+
+// ================= main =================
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', preserveDrawingBuffer: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const FOG = 0x0d1319;
+scene.background = new THREE.Color(FOG);
+scene.fog = new THREE.FogExp2(FOG, 0.011);
+const pm = new THREE.PMREMGenerator(renderer);
+scene.environment = pm.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.35;
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+const hemi = new THREE.HemisphereLight(0xdbe8f2, 0x3a3f44, 0.55);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+sun.position.set(-6, 26, 9); sun.target.position.set(0, 0, 0);
+sun.castShadow = true;
+sun.shadow.mapSize.set(4096, 4096);
+const sc = sun.shadow.camera;
+sc.left = -26; sc.right = 26; sc.top = 18; sc.bottom = -18; sc.near = 2; sc.far = 60;
+sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.03; sun.shadow.radius = 2.5;
+scene.add(sun, sun.target);
+
+// endoscope image is rendered into this target, then shown on the tower monitor and on screen
+const rtEndo = new THREE.WebGLRenderTarget(768, 768, { type: THREE.HalfFloatType, samples: 4 });
+const shared = { glowTex: TX.glowTexture(), endoTex: rtEndo.texture };
+const room = buildRoom(scene, shared);
+const patient = buildPatient(scene, shared, room.rig);
+
+const rtMain = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 });
+const composer = new EffectComposer(renderer, rtMain);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(512, 512), 0.45, 0.55, 1.2);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// ---------- on-screen endoscope picture (octagonal mask + HUD), drawn after the main view ----------
+const ovScene = new THREE.Scene();
+const ovCam = new THREE.OrthographicCamera(0, 1, 1, 0, -10, 10);
+const backdrop = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.84, depthTest: false, depthWrite: false }));
+const pipMat = new THREE.ShaderMaterial({
+  uniforms: { map: { value: rtEndo.texture } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: `uniform sampler2D map; varying vec2 vUv;
+    void main(){
+      vec2 p = vUv * 2.0 - 1.0;
+      float d = max(max(abs(p.x), abs(p.y)), (abs(p.x) + abs(p.y)) * 0.78);
+      float m = 1.0 - smoothstep(0.965, 0.985, d);
+      float frame = smoothstep(0.985, 0.99, d) * (1.0 - smoothstep(0.995, 1.0, max(abs(p.x), abs(p.y))));
+      vec3 c = texture2D(map, vUv).rgb * (1.0 - 0.38 * smoothstep(0.35, 1.0, length(p)));
+      gl_FragColor = vec4(c * m, max(m, 0.92 * step(max(abs(p.x), abs(p.y)), 0.999)));
+      #include <tonemapping_fragment>
+      #include <colorspace_fragment>
+    }`,
+  transparent: true, depthTest: false, depthWrite: false,
+});
+const pip = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), pipMat);
+const hudC = document.createElement('canvas'); hudC.width = hudC.height = 640;
+const hudG = hudC.getContext('2d');
+const hudTex = new THREE.CanvasTexture(hudC); hudTex.colorSpace = THREE.SRGBColorSpace;
+const hud = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false }));
+backdrop.renderOrder = 0; pip.renderOrder = 1; hud.renderOrder = 2;
+ovScene.add(backdrop, pip, hud);
+let hudKey = '';
+function drawHUD(tc) {
+  const I = patient.info, i = TL.stepAt(tc);
+  const clock = Math.max(0, tc - 16) / 77 * 22, mm = Math.floor(clock), ss = Math.floor((clock - mm) * 60);
+  const lines = I.inside
+    ? [`檢查時間 ${mm}:${String(ss).padStart(2, '0')}`, 'CO₂ 送氣', `插入長度 ${Math.round(I.depth)} cm`, I.seg, I.cade ? 'AI 偵測：息肉' : (i === 8 ? TL.polyPhase(tc) : '')]
+    : ['', '', '', '', ''];
+  const key = lines.join('|') + (I.inside ? '' : 'standby' + i);
+  if (key === hudKey) return; hudKey = key;
+  const g = hudG, W = 640;
+  g.clearRect(0, 0, W, W);
+  g.textBaseline = 'top';
+  g.font = `600 22px ${FONT}`; g.fillStyle = 'rgba(220,235,245,0.95)';
+  g.fillText('內視鏡即時影像', 22, 18); g.fillText(lines[0], 22, 48);
+  g.textAlign = 'right'; g.fillText(lines[1], W - 22, 18);
+  g.textBaseline = 'bottom'; g.fillText(lines[3], W - 22, W - 18);
+  g.textAlign = 'left'; g.fillText(lines[2], 22, W - 18);
+  if (lines[4]) {
+    g.font = `700 26px ${FONT}`; g.textAlign = 'center';
+    const w = g.measureText(lines[4]).width + 36;
+    g.fillStyle = I.cade ? 'rgba(20,90,40,0.85)' : 'rgba(150,80,10,0.85)'; TX.roundRect(g, W / 2 - w / 2, W - 112, w, 44, 12); g.fill();
+    g.fillStyle = '#fff'; g.textBaseline = 'middle'; g.fillText(lines[4], W / 2, W - 90);
+  }
+  if (!I.inside) {
+    g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = 'rgba(200,215,225,0.85)';
+    g.font = `700 34px ${FONT}`; g.fillText(i < 2 ? '內視鏡待機中' : i === 2 ? '準備插入' : '檢查結束', W / 2, W / 2 - 10);
+    g.font = `500 22px ${FONT}`; g.fillText('鏡頭進入腸道後會顯示即時畫面', W / 2, W / 2 + 30);
+  }
+  g.textAlign = 'left';
+  hudTex.needsUpdate = true;
+}
+
+// ---------- camera ----------
+const q = new URLSearchParams(location.search);
+const T = TL.T;
+const ORBIT = 32;
+const CEN = new V3(0.2, 8.8, -0.6);
+const look = new V3(), camGoal = new V3();
+function orbitPose(t) {
+  const a = 0.75 + (t / ORBIT) * Math.PI * 2;
+  camGoal.set(CEN.x + 17.5 * Math.cos(a), 14 + 1.2 * Math.sin(a * 2), CEN.z + 13.2 * Math.sin(a));
+  look.copy(CEN);
+}
+const _q = new THREE.Quaternion(), _c = new V3(), _o = new V3();
+function colonPose(t) {
+  const I = patient.info;
+  patient.anat.localToWorld(_c.set(0, 0.25, 0));
+  look.copy(_c).lerp(I.tipWorld, I.inside ? 0.3 : 0);
+  patient.anat.getWorldQuaternion(_q);
+  _o.set(Math.sin(t * 0.22) * 1.5, -1.2, 6.4).applyQuaternion(_q);
+  camGoal.copy(look).add(_o); camGoal.y += 3.4;
+}
+let simT = parseFloat(q.get('t') || '0') || 0, orbT = 0, last = performance.now();
+let paused = false, mode = 'orbit', blend = 1, speed = 1;
+const blendFrom = new V3(), lookFrom = new V3(), lookNow = new V3();
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enabled = false; controls.enableDamping = true; controls.dampingFactor = 0.08;
+controls.minDistance = 3; controls.maxDistance = 34; controls.maxPolarAngle = 1.5;
+orbitPose(0); camera.position.copy(camGoal); lookNow.copy(look); camera.lookAt(look);
+
+const MODES = [['orbit', '⟳ 環繞全景'], ['colon', '🔍 腸道透視'], ['scope', '🩺 內視鏡畫面'], ['free', '✋ 自由視角']];
+function setMode(m) {
+  const prev = mode; mode = m;
+  if (m === 'free') { controls.enabled = true; controls.target.copy(lookNow); controls.update(); }
+  else {
+    controls.enabled = false;
+    if (m === 'orbit' && prev !== 'orbit') {
+      const a = Math.atan2((camera.position.z - CEN.z) / 13.2, (camera.position.x - CEN.x) / 17.5);
+      orbT = ((((a - 0.75) / (Math.PI * 2)) % 1) + 1) % 1 * ORBIT;
+    }
+    blendFrom.copy(camera.position); lookFrom.copy(lookNow); blend = 0;
+  }
+  layout(); syncUI();
+}
+function setPaused(p) { paused = p; syncUI(); }
+const SPEEDS = [1, 0.5, 0.25, 2];
+function setSpeed(v) { speed = v; syncUI(); }
+function jumpStep(i) { i = ((i % 10) + 10) % 10; simT = Math.floor(simT / T) * T + TL.STEPS[i].t0 + 0.02; syncUI(); }
+const curStep = () => TL.stepAt(((simT % T) + T) % T);
+
+// ---------- UI ----------
+const css = document.createElement('style');
+css.textContent = `
+#ui,#cap,#sub{font:500 13px/1 ${FONT};user-select:none;z-index:5;
+  background:rgba(12,17,24,.66);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.12);color:#cfd8e2}
+#dock{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:8px;z-index:5;width:max-content;max-width:96vw}
+#ui{display:flex;flex-direction:column;gap:2px;padding:6px;border-radius:14px}
+#ui .row{display:flex;gap:4px;flex-wrap:wrap;justify-content:center;align-items:center}
+#ui .row span{padding:0 4px 0 8px;color:#8f9bab;font-size:12px}
+#cap{position:fixed;left:14px;top:14px;border-radius:12px;padding:10px 12px;display:grid;grid-template-columns:auto 1fr;gap:6px 10px;max-width:min(400px,44vw);line-height:1.25;font-size:12.5px}
+#cap b{font-weight:600;color:#8f9bab;white-space:nowrap}
+#cap .done{color:#5f7d6a}
+#cap .now{color:#ff9d8a}
+#cap .nowt{color:#fff}
+#cap h4{grid-column:1/3;margin:0 0 2px;font-size:13px;color:#fff;font-weight:700;letter-spacing:.04em}
+#sub{border-radius:12px;padding:12px 20px;font-size:18px;line-height:1.45;color:#fff;text-align:center;max-width:min(860px,92vw)}
+#sub small{display:block;font-size:12.5px;color:#ff9d8a;margin-bottom:4px;letter-spacing:.08em}
+.hide{display:none!important}
+#ui button{all:unset;cursor:pointer;padding:7px 10px;min-width:8px;text-align:center;border-radius:9px;color:#cfd8e2;white-space:nowrap;transition:background .15s,color .15s}
+#ui button:hover{background:rgba(255,255,255,.1)}
+#ui button:focus-visible{outline:2px solid #5ad;outline-offset:1px}
+#ui button.on{background:#ff8a72;color:#1a0d0a}
+#ui button.rec{background:#d92d2d;color:#fff}
+#ui i{width:1px;align-self:stretch;background:rgba(255,255,255,.16);margin:4px 3px}
+`;
+document.head.appendChild(css);
+const ui = document.createElement('div'); ui.id = 'ui';
+let row = null;
+const newRow = (label) => { row = document.createElement('div'); row.className = 'row'; ui.appendChild(row); if (label) { const s = document.createElement('span'); s.textContent = label; row.appendChild(s); } };
+const sep = () => row.appendChild(document.createElement('i'));
+const mk = (fn, text, title) => { const b = document.createElement('button'); b.type = 'button'; b.addEventListener('click', fn); if (text) b.textContent = text; if (title) b.title = title; row.appendChild(b); return b; };
+newRow('視角');
+const bModes = MODES.map(([m, n]) => mk(() => setMode(m), n));
+newRow('步驟');
+mk(() => jumpStep(curStep() - 1), '⏮', '上一步');
+const bSteps = TL.STEPS.map((s, i) => mk(() => jumpStep(i), String(i + 1), s.title));
+mk(() => jumpStep(curStep() + 1), '⏭', '下一步');
+newRow('播放');
+const bSpeeds = SPEEDS.map((v) => mk(() => setSpeed(v), v + '×'));
+sep();
+const bPause = mk(() => setPaused(!paused));
+const bRec = mk(() => toggleRec());
+sep();
+const bLbl = mk(() => { patient.show.labels = !patient.show.labels; syncUI(); }, '腸段標籤');
+const bAI = mk(() => { patient.show.ai = !patient.show.ai; hudKey = ''; syncUI(); }, 'AI 偵測框');
+const bBody = mk(() => { patient.show.body = !patient.show.body; syncUI(); }, '人體輪廓');
+const cap = document.createElement('div'); cap.id = 'cap';
+const capH = document.createElement('h4'); capH.textContent = '大腸鏡檢查流程'; cap.appendChild(capH);
+const capRows = TL.STEPS.map(() => { const b = document.createElement('b'), s = document.createElement('span'); cap.append(b, s); return [b, s]; });
+const sub = document.createElement('div'); sub.id = 'sub';
+const subT = document.createElement('small'), subX = document.createElement('div'); sub.append(subT, subX);
+const dock = document.createElement('div'); dock.id = 'dock'; dock.append(sub, ui);
+document.body.append(cap, dock);
+const overlays = [ui, cap, sub];
+let uiHidden = q.get('ui') === '0';
+if (uiHidden) overlays.forEach((e) => e.classList.add('hide'));
+
+function liveText(i, tc) {
+  const I = patient.info;
+  if (i === 0) return `清腸進度 ${Math.round(clamp01(tc / 8) * 100)}%`;
+  if (i === 1) return tc < 11.5 ? '接上監視器與點滴' : tc < 13.5 ? '靜脈給予鎮靜藥物' : '轉為左側躺';
+  if (i >= 2 && i <= 6) return I.inside ? `插入 ${Math.round(I.depth)} cm · ${I.seg}` : '潤滑、準備插入';
+  if (i === 7) { const m = clamp01((tc - 54) / 14) * 6, mm = Math.floor(m), ss = Math.floor((m - mm) * 60); return `退鏡觀察 ${mm}:${String(ss).padStart(2, '0')}（模擬）· ${I.seg}`; }
+  if (i === 8) return TL.polyPhase(tc);
+  return I.inside ? `退鏡中 ${Math.round(I.depth)} cm · ${I.seg}` : tc < 92.5 ? '退出內視鏡' : '恢復室休息';
+}
+let capLast = '';
+function updateCaptions(tc) {
+  const cur = TL.stepAt(tc);
+  const texts = TL.STEPS.map((s, i) => (i < cur ? '✓ 完成' : i === cur ? liveText(i, tc) : s.short));
+  const line = TL.lineAt(cur, tc);
+  const key = cur + '#' + texts.join('|') + line;
+  if (key === capLast) return; capLast = key;
+  TL.STEPS.forEach((s, i) => {
+    capRows[i][0].textContent = `${i + 1} ${s.title}`; capRows[i][1].textContent = texts[i];
+    capRows[i][0].className = i < cur ? 'done' : i === cur ? 'now' : '';
+    capRows[i][1].className = i < cur ? 'done' : i === cur ? 'nowt' : '';
+  });
+  subT.textContent = `第 ${cur + 1} 步 · ${TL.STEPS[cur].title}`;
+  subX.textContent = line;
+  bSteps.forEach((b, i) => b.classList.toggle('on', i === cur));
+}
+
+// ---------- layout of the endoscope picture ----------
+let pipS = 300;
+function layout() {
+  const W = window.innerWidth, H = window.innerHeight;
+  ovCam.left = 0; ovCam.right = W; ovCam.top = H; ovCam.bottom = 0; ovCam.updateProjectionMatrix();
+  backdrop.position.set(W / 2, H / 2, 0); backdrop.scale.set(W, H, 1);
+  let S, cx, cy;
+  const dh = uiHidden ? 0 : dock.offsetHeight + 14;
+  if (mode === 'scope') { S = Math.max(200, Math.min(H - dh - 28, W * 0.92)); cx = W / 2; cy = H - 14 - S / 2; }
+  else { S = Math.max(150, Math.min(H * 0.36, W * 0.3, 380)); cx = W - 14 - S / 2; cy = H - 14 - S / 2; }
+  pipS = S;
+  pip.position.set(cx, cy, 0); pip.scale.set(S, S, 1);
+  hud.position.set(cx, cy, 0); hud.scale.set(S, S, 1);
+  backdrop.visible = mode === 'scope';
+  cap.classList.toggle('hide', uiHidden || mode === 'scope');
+}
+
+// ---------- video recording (MP4 where the browser supports it, otherwise WebM) ----------
+let rec = null, recChunks = [], recStart = 0, recTimer = 0;
+const REC_MAX = 100;
+function pickMime() {
+  const c = ['video/mp4;codecs=avc1.640028', 'video/mp4;codecs=avc1.42E01E', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
+  return c.find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+}
+function toggleRec() {
+  if (rec) { rec.stop(); return; }
+  const mime = pickMime();
+  if (!mime) { bRec.textContent = '此瀏覽器不支援錄影'; return; }
+  const stream = renderer.domElement.captureStream(60);
+  rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12e6 });
+  recChunks = [];
+  rec.ondataavailable = (e) => { if (e.data.size) recChunks.push(e.data); };
+  rec.onstop = () => {
+    clearInterval(recTimer);
+    const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+    const url = URL.createObjectURL(new Blob(recChunks, { type: mime.split(';')[0] }));
+    const a = document.createElement('a'); a.href = url; a.download = `colonoscopy.${ext}`;
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
+    rec = null; syncUI();
+  };
+  rec.start(500); recStart = performance.now();
+  recTimer = setInterval(() => { if ((performance.now() - recStart) / 1000 >= REC_MAX) rec.stop(); else syncUI(); }, 500);
+  syncUI();
+}
+function syncUI() {
+  bRec.textContent = rec ? `■ 停止並下載 ${Math.floor((performance.now() - recStart) / 1000)}s` : '⏺ 錄製影片';
+  bRec.classList.toggle('rec', !!rec); bRec.title = `錄製畫面並下載影片（最長 ${REC_MAX} 秒，可錄完整一輪）`;
+  bPause.textContent = paused ? '▶ 播放' : '⏸ 暫停'; bPause.classList.toggle('on', paused);
+  bModes.forEach((b, i) => b.classList.toggle('on', MODES[i][0] === mode));
+  bModes[3].title = '用滑鼠拖曳旋轉、滾輪縮放';
+  bSpeeds.forEach((b, i) => b.classList.toggle('on', SPEEDS[i] === speed));
+  bLbl.classList.toggle('on', patient.show.labels); bAI.classList.toggle('on', patient.show.ai); bBody.classList.toggle('on', patient.show.body);
+}
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); setPaused(!paused); }
+  else if (e.key === 'o' || e.key === 'O') setMode('orbit');
+  else if (e.key === 'c' || e.key === 'C') setMode('colon');
+  else if (e.key === 'e' || e.key === 'E') setMode('scope');
+  else if (e.key === 'f' || e.key === 'F') setMode('free');
+  else if (e.key === 'h' || e.key === 'H') { uiHidden = !uiHidden; overlays.forEach((el) => el.classList.toggle('hide', uiHidden)); layout(); }
+  else if (e.key === 'n' || e.key === 'N') jumpStep(curStep() + 1);
+  else if (e.key === 'b' || e.key === 'B') jumpStep(curStep() - 1);
+  else if (e.key === '[' || e.key === ']') setSpeed(SPEEDS[(SPEEDS.indexOf(speed) + (e.key === ']' ? 1 : 3)) % 4]);
+  else if (e.key === 'r' || e.key === 'R') toggleRec();
+  else if (e.key >= '0' && e.key <= '9') jumpStep(e.key === '0' ? 9 : +e.key - 1);
+});
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h); composer.setSize(w, h);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+  layout();
+}
+window.addEventListener('resize', resize); resize();
+
+if (q.get('s')) jumpStep(+q.get('s') - 1);
+const qm = q.get('v'); if (qm && MODES.some(([m]) => m === qm)) { setMode(qm); blend = 1; }
+if (q.get('x')) setSpeed(+q.get('x'));
+syncUI();
+window.__time = () => simT;
+
+// adaptive quality: step down if the machine cannot hold a smooth frame rate
+let tier = 0, accT = 0, accN = 0, warm = 0;
+function setTier(n) {
+  tier = n;
+  const sm = [4096, 2048, 1024, 1024][n];
+  sun.shadow.mapSize.set(sm, sm);
+  if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
+  renderer.shadowMap.type = n >= 2 ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
+  scene.traverse((o) => { if (o.material) o.material.needsUpdate = true; });
+  const pr = [Math.min(window.devicePixelRatio || 1, 1.5), 1, 0.8, 0.6][n];
+  renderer.setPixelRatio(pr); composer.setPixelRatio(pr);
+  for (const r of [composer.renderTarget1, composer.renderTarget2]) { r.samples = n === 0 ? 4 : 0; r.dispose(); }
+  bloom.enabled = n < 3;
+  if (n >= 2) { rtEndo.setSize(512, 512); }
+  resize();
+}
+const q0 = parseInt(q.get('q') || '0'); if (q0) setTier(q0);
+
+const BLACK = new THREE.Color(0x000000);
+// keep the 3D text on the patient: hide any label whose footprint on screen falls on a staff member
+const ray = new THREE.Raycaster(); ray.layers.set(5);
+const _cr = new V3(), _cu = new V3(), _lp = new V3(), _pt = new V3(), _dir = new V3();
+let occN = 0;
+function labelsOffStaff(real) {
+  camera.updateMatrixWorld();
+  _cr.setFromMatrixColumn(camera.matrixWorld, 0); _cu.setFromMatrixColumn(camera.matrixWorld, 1);
+  const check = (occN++ % 2) === 0;
+  for (const l of patient.allLabels) {
+    if (!l.visible) { l.userData.fade = 0; continue; }
+    if (check) {
+      l.getWorldPosition(_lp);
+      const ws = new V3(); l.getWorldScale(ws);
+      let hit = false;
+      const fw = (l.material.map.userData.frac || 1) * ws.x * 1.08, fh = ws.y * 0.8;
+      for (const [a, b] of [[0, 0], [-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5], [-0.5, 0], [0.5, 0]]) {
+        _pt.copy(_lp).addScaledVector(_cr, a * fw).addScaledVector(_cu, b * fh);
+        _dir.subVectors(_pt, camera.position).normalize();
+        ray.set(camera.position, _dir);
+        if (ray.intersectObject(room.staffProxy, true).length) { hit = true; break; }
+      }
+      l.userData.hit = hit;
+    }
+    const goal = l.userData.hit ? 0 : 1;
+    l.userData.fade += (goal - l.userData.fade) * Math.min(1, (real || 0.016) * 10);
+    l.material.opacity *= l.userData.fade;
+    if (l.userData.fade < 0.02) l.visible = false;
+  }
+}
+function step(dt, real) {
+  simT += dt;
+  const tc = ((simT % T) + T) % T;
+  patient.update(tc, simT);
+  room.update(tc, simT, patient.info);
+  drawHUD(tc);
+  updateCaptions(tc);
+  if (mode === 'free') { controls.update(); lookNow.copy(controls.target); labelsOffStaff(real); return; }
+  if (mode === 'orbit') { orbT += real; orbitPose(orbT); } else colonPose(simT);
+  if (blend < 1) {
+    blend = Math.min(1, blend + real / 1.4);
+    const e = blend * blend * (3 - 2 * blend);
+    camera.position.lerpVectors(blendFrom, camGoal, e); lookNow.lerpVectors(lookFrom, look, e);
+  } else { camera.position.copy(camGoal); lookNow.copy(look); }
+  camera.lookAt(lookNow);
+  labelsOffStaff(real);
+}
+function render() {
+  renderer.setRenderTarget(rtEndo);
+  if (patient.info.inside) {
+    const bg = scene.background, fog = scene.fog;
+    scene.background = BLACK; scene.fog = null;
+    renderer.render(scene, patient.endoCam);
+    scene.background = bg; scene.fog = fog;
+  } else renderer.clear();
+  renderer.setRenderTarget(null);
+  composer.render();
+  renderer.autoClear = false; renderer.render(ovScene, ovCam); renderer.autoClear = true;
+}
+function frame(now) {
+  const raw = (now - last) / 1000;
+  const real = Math.min(0.05, Math.max(0, raw)); last = now;
+  if (++warm > 30 && tier < 3 && raw < 1) {
+    accT += raw; accN++;
+    if (accN >= 45) { if (accT / accN > 1 / 27) { setTier(tier + 1); warm = 0; } accT = 0; accN = 0; }
+  }
+  step(paused ? 0 : real * speed, paused && mode === 'orbit' ? 0 : real);
+  render();
+  requestAnimationFrame(frame);
+}
+// offline frame capture hook (used to render video files frame by frame)
+if (q.get('cap')) {
+  overlays.forEach((el) => el.classList.add('hide'));
+  window.__step = (dt) => { step(dt, dt); render(); return renderer.domElement.toDataURL('image/jpeg', 0.92); };
+  window.__seek = (t) => { simT = t; };
+  step(0, 0); render();
+} else requestAnimationFrame(frame);
+</script>
+</body>
+</html>
